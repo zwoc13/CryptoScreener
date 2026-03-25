@@ -61,9 +61,19 @@ You: screener --mode client     (TUI connects to server API)
 Bot: curl /events/stream        (subscribes to real-time events)
 ```
 
-### Multi-Exchange Ready
+### Multi-Exchange Support
 
-The exchange layer uses a pluggable adapter pattern (`BaseExchange` ABC). Currently Bybit is implemented. Adding Binance, OKX, or others means adding a single file in `screener/exchanges/`.
+Three exchanges are supported out of the box:
+
+| Exchange | Symbols | Default |
+|----------|---------|---------|
+| Bybit | 578+ | Enabled |
+| Binance | 539 | Disabled |
+| Gate.io | 656 | Disabled |
+
+Only Bybit is enabled by default. Enable additional exchanges in `config.yaml` by setting `enabled: true`. Each exchange you enable adds its own set of WebSocket connections, so consider your server resources — all three together track 1,700+ symbols simultaneously.
+
+The exchange layer uses a pluggable adapter pattern (`BaseExchange` ABC). Adding more exchanges (OKX, Bitget, etc.) means adding a single file in `screener/exchanges/`.
 
 ## Quick Start
 
@@ -115,8 +125,14 @@ All settings live in `config.yaml`. Key sections:
 ```yaml
 exchanges:
   bybit:
-    enabled: true
-    ws_connections: 2             # WS connections for tickers + klines
+    enabled: true                 # on by default
+    ws_connections: 2
+  binance:
+    enabled: false                # disabled by default — enable if you want Binance futures
+    ws_connections: 2
+  gateio:
+    enabled: false                # disabled by default — enable if you want Gate.io futures
+    ws_connections: 2
 
 impulse:
   threshold_pct: 3.0             # static trigger: price moves >= 3% in 60s

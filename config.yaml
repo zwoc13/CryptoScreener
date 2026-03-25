@@ -4,6 +4,16 @@ exchanges:
     ws_url: "wss://stream.bybit.com/v5/public/linear"
     rest_url: "https://api.bybit.com"
     ws_connections: 2
+  binance:
+    enabled: false
+    ws_url: "wss://fstream.binance.com"
+    rest_url: "https://fapi.binance.com"
+    ws_connections: 2
+  gateio:
+    enabled: false
+    ws_url: "wss://fx-ws.gateio.ws/v4/ws/usdt"
+    rest_url: "https://api.gateio.ws"
+    ws_connections: 2
 
 impulse:
   threshold_pct: 3.0

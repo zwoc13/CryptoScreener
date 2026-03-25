@@ -16,6 +16,8 @@ from .config import load_settings
 from .engine import Engine
 from .exchanges import get_exchange_class
 from .exchanges.bybit import BybitExchange  # noqa: F401 — triggers registration
+from .exchanges.binance import BinanceExchange  # noqa: F401 — triggers registration
+from .exchanges.gateio import GateioExchange  # noqa: F401 — triggers registration
 from .scheduler import run_daily_reset
 from .store import Store
 
