@@ -27,7 +27,7 @@ alerts:
     chat_ids: []
 
 schedule:
-  reset_hour: 2
+  reset_hour: 0
   reset_minute: 0
   timezone: "Europe/Kyiv"
 
