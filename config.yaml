@@ -1,0 +1,50 @@
+exchanges:
+  bybit:
+    enabled: true
+    ws_url: "wss://stream.bybit.com/v5/public/linear"
+    rest_url: "https://api.bybit.com"
+    ws_connections: 2
+
+impulse:
+  threshold_pct: 3.0
+  natr_multiplier: 2.5
+  combine_mode: "or"          # "or" = either triggers, "and" = both must trigger
+
+natr:
+  period: 14
+  interval: "5"
+
+funding:
+  alert_threshold: 0.01       # alert if abs(funding_rate) >= 1%
+
+alerts:
+  cooldown_seconds: 300
+  webhooks: []
+    # - url: "https://example.com/hook"
+    #   headers: {}
+  telegram:
+    bot_token: ""             # or set SCREENER_TELEGRAM_TOKEN env var
+    chat_ids: []
+
+schedule:
+  reset_hour: 2
+  reset_minute: 0
+  timezone: "Europe/Kyiv"
+
+tui:
+  refresh_ms: 750
+  max_rows: 100
+
+api:
+  port: 8000
+  host: "0.0.0.0"
+
+orderbook:
+  enabled: false
+  depth: 50
+  threshold_pct: 0.1          # order size as % of (24h_volume * price)
+  min_size_usd: 50000         # absolute minimum USD to count as "large"
+  max_distance_pct: 2.0       # ignore orders further than 2% from price
+  alert_on_new: false          # alert when large order first spotted
+  alert_on_eaten: false        # alert when large order disappears
+  ws_connections: 10

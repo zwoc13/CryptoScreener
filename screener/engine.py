@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections import deque
+from time import time
+
+from .config import Settings
+from .models import (
+    CandleBar,
+    FundingAlert,
+    ImpulseEvent,
+    KlineMessage,
+    TickerMessage,
+    TickerState,
+    TradeMessage,
+)
+from .store import Store
+
+logger = logging.getLogger(__name__)
+
+
+class Engine:
+    def __init__(
+        self,
+        store: Store,
+        alert_queue: asyncio.Queue,
+        settings: Settings,
+    ) -> None:
+        self._store = store
+        self._alert_queue = alert_queue
+        self._settings = settings
+        # Per-symbol sliding window of recent prices for impulse detection
+        self._price_history: dict[str, deque[tuple[float, float]]] = {}
+        # Per-symbol impulse cooldown: key -> timestamp of last impulse alert
+        self._impulse_cooldown: dict[str, float] = {}
+        # Track last funding rate alert per symbol to avoid repeat alerts
+        self._last_funding_alert: dict[str, float] = {}
+
+    async def run(self, msg_queue: asyncio.Queue) -> None:
+        logger.info("Engine started")
+        while True:
+            msg = await msg_queue.get()
+            try:
+                if isinstance(msg, TickerMessage):
+                    self._handle_ticker(msg)
+                elif isinstance(msg, KlineMessage):
+                    self._handle_kline(msg)
+                elif isinstance(msg, TradeMessage):
+                    self._handle_trade(msg)
+            except Exception:
+                logger.exception("Engine error processing message")
+            finally:
+                msg_queue.task_done()
+
+    def _handle_ticker(self, msg: TickerMessage) -> None:
+        ticker = self._store.get_or_create_ticker(msg.exchange, msg.symbol)
+        self._store.touch()
+        now = time()
+
+        old_price = ticker.last_price
+
+        if msg.last_price is not None:
+            ticker.last_price = msg.last_price
+        if msg.volume_24h is not None:
+            ticker.volume_24h = msg.volume_24h
+        if msg.funding_rate is not None:
+            ticker.funding_rate = msg.funding_rate
+        if msg.funding_interval_h is not None:
+            ticker.funding_interval_h = msg.funding_interval_h
+        if msg.next_funding_ts is not None:
+            ticker.next_funding_ts = msg.next_funding_ts
+        ticker.last_update_ts = now
+
+        price = ticker.last_price
+        if price <= 0:
+            return
+
+        # Daily change from reset price
+        if ticker.reset_price > 0:
+            ticker.daily_change_pct = ((price - ticker.reset_price) / ticker.reset_price) * 100
+        elif ticker.reset_price == 0:
+            ticker.reset_price = price
+
+        # 1m range tracking
+        self._update_1m_range(ticker, price, now)
+
+        # Impulse detection
+        if old_price > 0 and price != old_price:
+            self._check_impulse(ticker, old_price, price, now)
+
+        # Funding rate alert
+        if msg.funding_rate is not None:
+            self._check_funding(ticker)
+
+    def _handle_kline(self, msg: KlineMessage) -> None:
+        self._store.touch()
+
+        if msg.interval == "5":
+            self._store.add_candle(msg.exchange, msg.symbol, msg.candle)
+            ticker = self._store.get_or_create_ticker(msg.exchange, msg.symbol)
+
+            # Update range_5m from latest candle
+            ticker.range_5m = msg.candle.high - msg.candle.low
+
+            # Recompute NATR and trend when candle is confirmed
+            if msg.candle.confirmed:
+                natr = self._compute_natr(msg.exchange, msg.symbol)
+                if natr is not None:
+                    ticker.natr_5m_14 = natr
+                ticker.trend = self._compute_trend(msg.exchange, msg.symbol)
+
+    def _handle_trade(self, msg: TradeMessage) -> None:
+        self._store.touch()
+        delta = msg.size if msg.side == "Buy" else -msg.size
+        self._store.add_trade_delta(msg.exchange, msg.symbol, delta, msg.timestamp)
+
+    def _update_1m_range(self, ticker: TickerState, price: float, now: float) -> None:
+        if now - ticker.minute_start_ts >= 60:
+            if ticker.minute_high > 0 and ticker.minute_low < float("inf"):
+                ticker.range_1m = ticker.minute_high - ticker.minute_low
+            ticker.minute_high = price
+            ticker.minute_low = price
+            ticker.minute_start_ts = now
+        else:
+            if price > ticker.minute_high:
+                ticker.minute_high = price
+            if price < ticker.minute_low:
+                ticker.minute_low = price
+            ticker.range_1m = ticker.minute_high - ticker.minute_low
+
+    def _compute_natr(self, exchange: str, symbol: str) -> float | None:
+        candles = self._store.get_candles(exchange, symbol)
+        period = self._settings.natr.period
+        if len(candles) < period + 1:
+            return None
+
+        recent = list(candles)[-period - 1 :]
+        tr_values: list[float] = []
+        for i in range(1, len(recent)):
+            prev_close = recent[i - 1].close
+            cur = recent[i]
+            tr = max(
+                cur.high - cur.low,
+                abs(cur.high - prev_close),
+                abs(cur.low - prev_close),
+            )
+            tr_values.append(tr)
+
+        atr = sum(tr_values) / len(tr_values)
+        close = recent[-1].close
+        if close <= 0:
+            return None
+        return (atr / close) * 100
+
+    def _compute_trend(self, exchange: str, symbol: str) -> str:
+        """Detect trend from 5m candles using higher-highs/lower-lows."""
+        candles = self._store.get_candles(exchange, symbol)
+        if len(candles) < 6:
+            return "-"
+
+        # Use last 6 confirmed candles for trend detection
+        recent = [c for c in candles if c.confirmed][-6:]
+        if len(recent) < 4:
+            return "-"
+
+        # Count higher-highs and lower-lows
+        higher_highs = 0
+        lower_lows = 0
+        higher_lows = 0
+        lower_highs = 0
+
+        for i in range(1, len(recent)):
+            if recent[i].high > recent[i - 1].high:
+                higher_highs += 1
+            else:
+                lower_highs += 1
+            if recent[i].low > recent[i - 1].low:
+                higher_lows += 1
+            else:
+                lower_lows += 1
+
+        n = len(recent) - 1
+        # Uptrend: majority higher-highs AND higher-lows
+        if higher_highs >= n * 0.6 and higher_lows >= n * 0.6:
+            return "UP"
+        # Downtrend: majority lower-highs AND lower-lows
+        if lower_highs >= n * 0.6 and lower_lows >= n * 0.6:
+            return "DOWN"
+        return "RANGE"
+
+    def _check_impulse(
+        self, ticker: TickerState, old_price: float, new_price: float, now: float
+    ) -> None:
+        key = f"{ticker.exchange}:{ticker.symbol}"
+
+        # Engine-level cooldown: don't check again for 60s after firing
+        last_impulse = self._impulse_cooldown.get(key, 0)
+        if now - last_impulse < 60:
+            return
+
+        history = self._price_history.setdefault(key, deque(maxlen=120))
+        history.append((now, new_price))
+
+        cutoff = now - 60
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+        if len(history) < 2:
+            return
+
+        oldest_price = history[0][1]
+        if oldest_price <= 0:
+            return
+
+        change_pct = abs((new_price - oldest_price) / oldest_price) * 100
+        direction = "up" if new_price > oldest_price else "down"
+
+        threshold = self._settings.impulse.threshold_pct
+        natr_mult = self._settings.impulse.natr_multiplier
+        combine = self._settings.impulse.combine_mode
+
+        static_triggered = change_pct >= threshold
+        natr_triggered = False
+        if ticker.natr_5m_14 > 0:
+            natr_triggered = change_pct >= (natr_mult * ticker.natr_5m_14)
+
+        triggered = False
+        if combine == "or":
+            triggered = static_triggered or natr_triggered
+        elif combine == "and":
+            triggered = static_triggered and natr_triggered
+
+        if triggered:
+            self._impulse_cooldown[key] = now
+            # Reset price history so the window starts fresh after the impulse
+            history.clear()
+            history.append((now, new_price))
+
+            event = ImpulseEvent(
+                exchange=ticker.exchange,
+                symbol=ticker.symbol,
+                direction=direction,
+                change_pct=round(change_pct, 2),
+                natr_value=round(ticker.natr_5m_14, 4),
+                price=new_price,
+                volume_24h=ticker.volume_24h,
+            )
+            self._alert_queue.put_nowait(event)
+            logger.info(
+                "Impulse: %s %s %s %.2f%% (NATR: %.4f)",
+                ticker.exchange, ticker.symbol, direction, change_pct, ticker.natr_5m_14,
+            )
+
+    def _check_funding(self, ticker: TickerState) -> None:
+        threshold = self._settings.funding.alert_threshold
+        rate = ticker.funding_rate
+        if abs(rate) < threshold:
+            return
+
+        key = f"{ticker.exchange}:{ticker.symbol}"
+        last = self._last_funding_alert.get(key, 0.0)
+        if last == rate:
+            return
+        self._last_funding_alert[key] = rate
+
+        alert = FundingAlert(
+            exchange=ticker.exchange,
+            symbol=ticker.symbol,
+            rate=rate,
+            price=ticker.last_price,
+        )
+        self._alert_queue.put_nowait(alert)
+        logger.info(
+            "Funding alert: %s %s rate=%.4f%%",
+            ticker.exchange, ticker.symbol, rate * 100,
+        )
