@@ -63,7 +63,10 @@ class AlertDispatcher:
         else:
             key = f"{event.exchange}:{event.symbol}:{alert_type}"
         now = time()
-        cooldown = self._settings.alerts.cooldown_seconds
+        if isinstance(event, ImpulseEvent):
+            cooldown = self._settings.impulse.cooldown_seconds
+        else:
+            cooldown = self._settings.alerts.cooldown_seconds
         last = self._cooldowns.get(key, 0)
         if now - last < cooldown:
             return

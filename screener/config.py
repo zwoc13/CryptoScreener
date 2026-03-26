@@ -18,6 +18,7 @@ class ImpulseConfig(BaseModel):
     threshold_pct: float = 3.0
     natr_multiplier: float = 2.5
     combine_mode: str = "or"  # "or" | "and"
+    cooldown_seconds: int = 30
 
 
 class NatrConfig(BaseModel):
@@ -83,6 +84,10 @@ class NewsConfig(BaseModel):
     lookback_hours: int = 72  # only alert on announcements from last 72h
 
 
+class FilterConfig(BaseModel):
+    delist_filter_days: float = 7.0  # suppress signals for tickers delisting within N days
+
+
 class ApiConfig(BaseModel):
     port: int = 8000
     host: str = "0.0.0.0"
@@ -100,6 +105,7 @@ class Settings(BaseModel):
     orderbook: OrderbookConfig = Field(default_factory=OrderbookConfig)
     data_streams: DataStreamsConfig = Field(default_factory=DataStreamsConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
+    filters: FilterConfig = Field(default_factory=FilterConfig)
 
 
 def load_settings(path: str | Path = "config.yaml") -> Settings:

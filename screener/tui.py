@@ -461,7 +461,7 @@ class ScreenerApp(App):
             cvd = cvd_cache.get(k, {"_cvd_5m": 0, "_cvd_1h": 0, "_cvd_daily": 0, "_liq_net_5m": 0, "_trade_imb_1m": 0.5})
             row_data = (
                 t.exchange.upper(),
-                t.symbol,
+                _fmt_symbol(t.symbol, t.delist_ts, self._settings.filters.delist_filter_days),
                 _color_trend(t.trend),
                 _color_pct(t.daily_change_pct),
                 _color_cvd(cvd["_cvd_5m"]),
@@ -688,6 +688,12 @@ def _fmt_volume(v: float) -> str:
     if v >= 1_000:
         return f"{v / 1_000:.2f}K"
     return f"{v:.0f}"
+
+
+def _fmt_symbol(symbol: str, delist_ts: float, delist_filter_days: float) -> str:
+    if delist_ts > 0 and delist_ts - time() <= delist_filter_days * 86_400:
+        return f"[dim]{symbol} [red]\\[D][/red][/dim]"
+    return symbol
 
 
 def _fmt_funding_countdown(next_ts: float) -> str:

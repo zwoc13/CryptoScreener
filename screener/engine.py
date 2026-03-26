@@ -99,6 +99,13 @@ class Engine:
         # 1m range tracking
         self._update_1m_range(ticker, price, now)
 
+        # Skip signal generation for tickers delisting within the configured window
+        delist_ts = ticker.delist_ts
+        if delist_ts > 0:
+            delist_cutoff = self._settings.filters.delist_filter_days * 86_400
+            if delist_ts - now <= delist_cutoff:
+                return
+
         # Impulse detection
         if old_price > 0 and price != old_price:
             self._check_impulse(ticker, old_price, price, now)
@@ -229,9 +236,9 @@ class Engine:
     ) -> None:
         key = f"{ticker.exchange}:{ticker.symbol}"
 
-        # Engine-level cooldown: don't check again for 60s after firing
+        # Engine-level cooldown: don't check again for N seconds after firing
         last_impulse = self._impulse_cooldown.get(key, 0)
-        if now - last_impulse < 60:
+        if now - last_impulse < self._settings.impulse.cooldown_seconds:
             return
 
         history = self._price_history.setdefault(key, deque(maxlen=120))
