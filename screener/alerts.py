@@ -140,13 +140,27 @@ class AlertDispatcher:
     def _format_telegram(self, event: AlertEvent, alert_type: str) -> str:
         if isinstance(event, ImpulseEvent):
             arrow = "↑" if event.direction == "up" else "↓"
-            return (
-                f"*Impulse {arrow}* `{event.exchange.upper()}`\n"
-                f"*{event.symbol}* {'+' if event.direction == 'up' else '-'}{event.change_pct}%\n"
-                f"Price: `{event.price}`\n"
-                f"NATR: `{event.natr_value}`\n"
-                f"Vol 24h: `{_fmt_volume(event.volume_24h)}`"
-            )
+            lines = [
+                f"*Impulse {arrow}* `{event.exchange.upper()}`",
+                f"*{event.symbol}* {'+' if event.direction == 'up' else '-'}{event.change_pct}%",
+                f"Price: `{event.price}`  |  Daily: `{event.daily_change_pct:+.2f}%`",
+                f"NATR: `{event.natr_value}`  |  Trend: `{event.trend}`",
+                f"CVD 5m/1h/D: `{event.cvd_5m}` / `{event.cvd_1h}` / `{event.cvd_daily}`",
+                f"Range 1m/5m: `{event.range_1m}` / `{event.range_5m}`",
+                f"Funding: `{event.funding_rate * 100:.4f}%`",
+                f"Vol 24h: `{_fmt_volume(event.volume_24h)}`",
+            ]
+            if event.open_interest > 0:
+                lines.append(
+                    f"OI: `${_fmt_volume(event.open_interest)}` ({event.oi_change_5m_pct:+.2f}% 5m)"
+                )
+            if event.liq_buys_5m > 0 or event.liq_sells_5m > 0:
+                lines.append(
+                    f"Liq 5m: L `${_fmt_volume(event.liq_buys_5m)}` / S `${_fmt_volume(event.liq_sells_5m)}`"
+                )
+            if event.long_short_ratio > 0:
+                lines.append(f"L/S Ratio: `{event.long_short_ratio:.2f}`")
+            return "\n".join(lines)
         elif isinstance(event, FundingAlert):
             return (
                 f"*High Funding Rate* `{event.exchange.upper()}`\n"

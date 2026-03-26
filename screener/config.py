@@ -68,6 +68,14 @@ class OrderbookConfig(BaseModel):
     ws_connections: int = 10
 
 
+class DataStreamsConfig(BaseModel):
+    oi_enabled: bool = True
+    liquidations_enabled: bool = True
+    long_short_ratio_enabled: bool = True
+    ls_ratio_poll_interval_s: int = 300  # 5 minutes
+    oi_poll_interval_s: int = 60  # for Binance REST polling
+
+
 class ApiConfig(BaseModel):
     port: int = 8000
     host: str = "0.0.0.0"
@@ -83,6 +91,7 @@ class Settings(BaseModel):
     tui: TuiConfig = Field(default_factory=TuiConfig)
     api: ApiConfig = Field(default_factory=ApiConfig)
     orderbook: OrderbookConfig = Field(default_factory=OrderbookConfig)
+    data_streams: DataStreamsConfig = Field(default_factory=DataStreamsConfig)
 
 
 def load_settings(path: str | Path = "config.yaml") -> Settings:

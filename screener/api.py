@@ -32,6 +32,9 @@ def _ticker_dict(store: Store, t) -> dict:
         "next_funding_ts": t.next_funding_ts,
         "last_price": t.last_price,
         "last_update_ts": t.last_update_ts,
+        "open_interest": t.open_interest,
+        "oi_change_5m_pct": round(t.oi_change_5m_pct, 2),
+        "long_short_ratio": t.long_short_ratio,
     }
 
 

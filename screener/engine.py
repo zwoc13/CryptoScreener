@@ -79,6 +79,11 @@ class Engine:
             ticker.funding_interval_h = msg.funding_interval_h
         if msg.next_funding_ts is not None:
             ticker.next_funding_ts = msg.next_funding_ts
+        if msg.open_interest_value is not None:
+            oi_usd = msg.open_interest_value
+            self._store.update_open_interest(msg.exchange, msg.symbol, oi_usd, now)
+            ticker.open_interest = oi_usd
+            ticker.oi_change_5m_pct = self._store.get_oi_change_5m_pct(msg.exchange, msg.symbol)
         ticker.last_update_ts = now
 
         price = ticker.last_price
@@ -123,6 +128,24 @@ class Engine:
         self._store.touch()
         delta = msg.size if msg.side == "Buy" else -msg.size
         self._store.add_trade_delta(msg.exchange, msg.symbol, delta, msg.timestamp)
+
+    def _handle_open_interest(self, msg: OpenInterestMessage) -> None:
+        self._store.touch()
+        ticker = self._store.get_or_create_ticker(msg.exchange, msg.symbol)
+        oi_usd = msg.open_interest_value if msg.open_interest_value > 0 else msg.open_interest
+        self._store.update_open_interest(msg.exchange, msg.symbol, oi_usd, msg.timestamp)
+        ticker.open_interest = oi_usd
+        ticker.oi_change_5m_pct = self._store.get_oi_change_5m_pct(msg.exchange, msg.symbol)
+
+    def _handle_liquidation(self, msg: LiquidationMessage) -> None:
+        self._store.touch()
+        usd_vol = msg.size * msg.price
+        self._store.add_liquidation(msg.exchange, msg.symbol, msg.side, usd_vol, msg.timestamp)
+
+    def _handle_long_short_ratio(self, msg: LongShortRatioMessage) -> None:
+        self._store.touch()
+        ticker = self._store.get_or_create_ticker(msg.exchange, msg.symbol)
+        ticker.long_short_ratio = msg.long_short_ratio
 
     def _update_1m_range(self, ticker: TickerState, price: float, now: float) -> None:
         if now - ticker.minute_start_ts >= 60:
@@ -246,6 +269,9 @@ class Engine:
             history.clear()
             history.append((now, new_price))
 
+            liq_buys, liq_sells = self._store.get_liq_rolling(
+                ticker.exchange, ticker.symbol, 300
+            )
             event = ImpulseEvent(
                 exchange=ticker.exchange,
                 symbol=ticker.symbol,
@@ -254,6 +280,19 @@ class Engine:
                 natr_value=round(ticker.natr_5m_14, 4),
                 price=new_price,
                 volume_24h=ticker.volume_24h,
+                cvd_5m=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 300), 2),
+                cvd_1h=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 3600), 2),
+                cvd_daily=round(self._store.get_cvd_daily(ticker.exchange, ticker.symbol), 2),
+                funding_rate=ticker.funding_rate,
+                trend=ticker.trend,
+                daily_change_pct=round(ticker.daily_change_pct, 2),
+                range_1m=ticker.range_1m,
+                range_5m=ticker.range_5m,
+                open_interest=ticker.open_interest,
+                oi_change_5m_pct=round(ticker.oi_change_5m_pct, 2),
+                liq_buys_5m=round(liq_buys, 2),
+                liq_sells_5m=round(liq_sells, 2),
+                long_short_ratio=ticker.long_short_ratio,
             )
             self._alert_queue.put_nowait(event)
             logger.info(

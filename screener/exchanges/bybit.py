@@ -11,7 +11,15 @@ import websockets
 import websockets.exceptions
 
 from ..config import ExchangeConfig
-from ..models import CandleBar, KlineMessage, TickerMessage, TradeMessage
+from ..config import Settings
+from ..models import (
+    CandleBar,
+    KlineMessage,
+    LiquidationMessage,
+    LongShortRatioMessage,
+    TickerMessage,
+    TradeMessage,
+)
 from . import BaseExchange, register_exchange
 
 if TYPE_CHECKING:
@@ -29,8 +37,9 @@ _PING_INTERVAL = 18
 class BybitExchange(BaseExchange):
     name = "bybit"
 
-    def __init__(self, config: ExchangeConfig) -> None:
+    def __init__(self, config: ExchangeConfig, settings: Settings | None = None) -> None:
         self._config = config
+        self._settings = settings
         self._ws_tasks: list[asyncio.Task] = []
         self._running = False
         self._ob_manager: OrderbookManager | None = None
@@ -109,12 +118,16 @@ class BybitExchange(BaseExchange):
         self._ob_manager = orderbook_manager
         n_conns = self._config.ws_connections
 
+        ds = self._settings.data_streams if self._settings else None
+
         # Build ticker+kline topics, split across n_conns connections
         ticker_kline_topics: list[list[str]] = [[] for _ in range(n_conns)]
         for i, sym in enumerate(symbols):
             bucket = i % n_conns
             ticker_kline_topics[bucket].append(f"tickers.{sym}")
             ticker_kline_topics[bucket].append(f"kline.5.{sym}")
+            if ds and ds.liquidations_enabled:
+                ticker_kline_topics[bucket].append(f"liquidation.{sym}")
 
         conn_id = 0
         for topics in ticker_kline_topics:
@@ -155,7 +168,15 @@ class BybitExchange(BaseExchange):
                 self._ws_tasks.append(task)
                 conn_id += 1
 
-        logger.info("Bybit: launching %d WS connections", conn_id)
+        # Long/Short ratio REST poller
+        if ds and ds.long_short_ratio_enabled:
+            task = asyncio.create_task(
+                self._long_short_ratio_poller(symbols, queue),
+                name="bybit-ls-ratio-poller",
+            )
+            self._ws_tasks.append(task)
+
+        logger.info("Bybit: launching %d WS connections + pollers", conn_id)
         await asyncio.gather(*self._ws_tasks, return_exceptions=True)
 
     async def _ws_loop(
@@ -231,6 +252,10 @@ class BybitExchange(BaseExchange):
                             parsed_t = self._parse_trade(topic, trade)
                             if parsed_t:
                                 await queue.put(parsed_t)
+                    elif topic.startswith("liquidation."):
+                        parsed_l = self._parse_liquidation(topic, msg_data)
+                        if parsed_l:
+                            await queue.put(parsed_l)
                     elif topic.startswith("orderbook."):
                         if self._ob_manager is not None:
                             self._handle_orderbook(topic, msg_data, data.get("type"))
@@ -263,6 +288,10 @@ class BybitExchange(BaseExchange):
         if raw_next is not None and raw_next != "":
             next_funding_ts = float(raw_next) / 1000  # ms -> seconds
 
+        # Open Interest (included in tickers stream)
+        oi = _float_or_none(data.get("openInterest"))
+        oi_value = _float_or_none(data.get("openInterestValue"))
+
         return TickerMessage(
             exchange="bybit",
             symbol=symbol,
@@ -273,6 +302,8 @@ class BybitExchange(BaseExchange):
             next_funding_ts=next_funding_ts,
             high_24h=_float_or_none(data.get("highPrice24h")),
             low_24h=_float_or_none(data.get("lowPrice24h")),
+            open_interest=oi,
+            open_interest_value=oi_value,
         )
 
     def _parse_kline(self, topic: str, data: list | dict) -> KlineMessage | None:
@@ -323,6 +354,61 @@ class BybitExchange(BaseExchange):
             )
         except (KeyError, ValueError):
             return None
+
+    def _parse_liquidation(self, topic: str, data: dict) -> LiquidationMessage | None:
+        # topic: "liquidation.BTCUSDT"
+        symbol = topic.split(".", 1)[1]
+        try:
+            return LiquidationMessage(
+                exchange="bybit",
+                symbol=symbol,
+                side=data["side"],  # "Buy" or "Sell"
+                size=float(data["size"]),
+                price=float(data["price"]),
+                timestamp=float(data["updatedTime"]) / 1000,
+            )
+        except (KeyError, ValueError):
+            return None
+
+    async def _long_short_ratio_poller(
+        self, symbols: list[str], queue: asyncio.Queue
+    ) -> None:
+        """Poll Bybit REST API for long/short ratio every N seconds."""
+        ds = self._settings.data_streams if self._settings else None
+        interval = ds.ls_ratio_poll_interval_s if ds else 300
+        async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
+            while self._running:
+                try:
+                    for sym in symbols:
+                        if not self._running:
+                            break
+                        try:
+                            resp = await client.get(
+                                "/v5/market/account-ratio",
+                                params={"category": "linear", "symbol": sym, "period": "5min", "limit": 1},
+                            )
+                            if resp.status_code != 200:
+                                continue
+                            data = resp.json()
+                            items = data.get("result", {}).get("list", [])
+                            if items:
+                                ratio = float(items[0].get("buyRatio", 0)) / max(
+                                    float(items[0].get("sellRatio", 1)), 0.0001
+                                )
+                                await queue.put(LongShortRatioMessage(
+                                    exchange="bybit",
+                                    symbol=sym,
+                                    long_short_ratio=round(ratio, 4),
+                                    timestamp=time(),
+                                ))
+                        except Exception:
+                            pass  # skip individual symbol errors
+                        await asyncio.sleep(0.1)  # rate limit protection
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    logger.exception("Bybit L/S ratio poller error")
+                await asyncio.sleep(interval)
 
     async def stop(self) -> None:
         self._running = False

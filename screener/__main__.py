@@ -57,7 +57,7 @@ async def run(mode: str) -> None:
         if not cfg.enabled:
             continue
         cls = get_exchange_class(name)
-        ex = cls(cfg)
+        ex = cls(cfg, settings=settings)
         exchanges.append(ex)
 
     if not exchanges:

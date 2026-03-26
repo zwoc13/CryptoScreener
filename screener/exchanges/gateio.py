@@ -11,8 +11,8 @@ import httpx
 import websockets
 import websockets.exceptions
 
-from ..config import ExchangeConfig
-from ..models import CandleBar, KlineMessage, TickerMessage, TradeMessage
+from ..config import ExchangeConfig, Settings
+from ..models import CandleBar, KlineMessage, LiquidationMessage, TickerMessage, TradeMessage
 from . import BaseExchange, register_exchange
 
 if TYPE_CHECKING:
@@ -38,8 +38,9 @@ _INTERVAL_MAP = {
 class GateioExchange(BaseExchange):
     name = "gateio"
 
-    def __init__(self, config: ExchangeConfig) -> None:
+    def __init__(self, config: ExchangeConfig, settings: Settings | None = None) -> None:
         self._config = config
+        self._settings = settings
         self._ws_tasks: list[asyncio.Task] = []
         self._running = False
 
@@ -187,6 +188,18 @@ class GateioExchange(BaseExchange):
                         "payload": batch,
                     }))
 
+            # Subscribe to liquidations
+            ds = self._settings.data_streams if self._settings else None
+            if ds and ds.liquidations_enabled:
+                for i in range(0, len(symbols), _SUB_BATCH_SIZE):
+                    batch = symbols[i : i + _SUB_BATCH_SIZE]
+                    await ws.send(json.dumps({
+                        "time": now,
+                        "channel": "futures.liquidates",
+                        "event": "subscribe",
+                        "payload": batch,
+                    }))
+
             logger.info(
                 "Gate.io WS-%d subscribed for %d symbols", conn_id, len(symbols)
             )
@@ -226,6 +239,11 @@ class GateioExchange(BaseExchange):
                             parsed_t = self._parse_trade(item)
                             if parsed_t:
                                 await queue.put(parsed_t)
+                    elif channel == "futures.liquidates":
+                        for item in (result if isinstance(result, list) else [result]):
+                            parsed_l = self._parse_liquidation(item)
+                            if parsed_l:
+                                await queue.put(parsed_l)
             finally:
                 ping_task.cancel()
 
@@ -250,6 +268,9 @@ class GateioExchange(BaseExchange):
             if raw_rate is not None and raw_rate != "":
                 funding_rate = float(raw_rate)
 
+            # total_size is OI in contracts (available in GateIO futures.tickers)
+            oi = _float_or_none(data.get("total_size"))
+
             return TickerMessage(
                 exchange="gateio",
                 symbol=contract,
@@ -258,6 +279,8 @@ class GateioExchange(BaseExchange):
                 funding_rate=funding_rate,
                 high_24h=_float_or_none(data.get("high_24h")),
                 low_24h=_float_or_none(data.get("low_24h")),
+                open_interest=oi,
+                open_interest_value=None,  # GateIO doesn't provide USD value directly
             )
         except (KeyError, ValueError):
             return None
@@ -310,6 +333,23 @@ class GateioExchange(BaseExchange):
                 size=abs(size),
                 price=float(data["price"]),
                 timestamp=float(data.get("create_time_ms", data.get("create_time", 0) * 1000)) / 1000,
+            )
+        except (KeyError, ValueError):
+            return None
+
+    def _parse_liquidation(self, data: dict) -> LiquidationMessage | None:
+        try:
+            contract = data.get("contract", "")
+            # GateIO: positive size = long liquidation, negative = short liquidation
+            size = float(data.get("size", 0))
+            side = "Buy" if size > 0 else "Sell"
+            return LiquidationMessage(
+                exchange="gateio",
+                symbol=contract,
+                side=side,
+                size=abs(size),
+                price=float(data.get("order_price", data.get("fill_price", 0))),
+                timestamp=float(data.get("time_ms", data.get("time", 0) * 1000)) / 1000,
             )
         except (KeyError, ValueError):
             return None

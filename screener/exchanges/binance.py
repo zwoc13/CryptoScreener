@@ -10,8 +10,18 @@ import httpx
 import websockets
 import websockets.exceptions
 
-from ..config import ExchangeConfig
-from ..models import CandleBar, KlineMessage, TickerMessage, TradeMessage
+from time import time
+
+from ..config import ExchangeConfig, Settings
+from ..models import (
+    CandleBar,
+    KlineMessage,
+    LiquidationMessage,
+    LongShortRatioMessage,
+    OpenInterestMessage,
+    TickerMessage,
+    TradeMessage,
+)
 from . import BaseExchange, register_exchange
 
 if TYPE_CHECKING:
@@ -38,8 +48,9 @@ _INTERVAL_MAP = {
 class BinanceExchange(BaseExchange):
     name = "binance"
 
-    def __init__(self, config: ExchangeConfig) -> None:
+    def __init__(self, config: ExchangeConfig, settings: Settings | None = None) -> None:
         self._config = config
+        self._settings = settings
         self._ws_tasks: list[asyncio.Task] = []
         self._running = False
 
@@ -135,7 +146,39 @@ class BinanceExchange(BaseExchange):
                 self._ws_tasks.append(task)
                 conn_id += 1
 
-        logger.info("Binance: launching %d WS connections", conn_id)
+        ds = self._settings.data_streams if self._settings else None
+
+        # Liquidation streams (forceOrder)
+        if ds and ds.liquidations_enabled:
+            liq_streams: list[str] = [f"{sym.lower()}@forceOrder" for sym in symbols]
+            n_liq_conns = max(1, math.ceil(len(liq_streams) / _MAX_STREAMS_PER_CONN))
+            chunk = math.ceil(len(liq_streams) / n_liq_conns)
+            for i in range(0, len(liq_streams), chunk):
+                batch = liq_streams[i : i + chunk]
+                task = asyncio.create_task(
+                    self._ws_loop(conn_id, batch, queue),
+                    name=f"binance-ws-liq-{conn_id}",
+                )
+                self._ws_tasks.append(task)
+                conn_id += 1
+
+        # OI REST poller
+        if ds and ds.oi_enabled:
+            task = asyncio.create_task(
+                self._oi_poller(symbols, queue),
+                name="binance-oi-poller",
+            )
+            self._ws_tasks.append(task)
+
+        # Long/Short ratio REST poller
+        if ds and ds.long_short_ratio_enabled:
+            task = asyncio.create_task(
+                self._long_short_ratio_poller(symbols, queue),
+                name="binance-ls-ratio-poller",
+            )
+            self._ws_tasks.append(task)
+
+        logger.info("Binance: launching %d WS connections + pollers", conn_id)
         await asyncio.gather(*self._ws_tasks, return_exceptions=True)
 
     async def _ws_loop(
@@ -201,6 +244,10 @@ class BinanceExchange(BaseExchange):
                         parsed_t = self._parse_trade(data)
                         if parsed_t:
                             await queue.put(parsed_t)
+                    elif stream.endswith("@forceOrder"):
+                        parsed_l = self._parse_liquidation(data)
+                        if parsed_l:
+                            await queue.put(parsed_l)
             finally:
                 ping_task.cancel()
 
@@ -269,6 +316,95 @@ class BinanceExchange(BaseExchange):
             )
         except (KeyError, ValueError):
             return None
+
+    def _parse_liquidation(self, data: dict) -> LiquidationMessage | None:
+        try:
+            o = data["o"]
+            # Binance: S=side of the order (SELL means long was liquidated → "Buy" liq)
+            side = "Buy" if o["S"] == "SELL" else "Sell"
+            return LiquidationMessage(
+                exchange="binance",
+                symbol=o["s"],
+                side=side,
+                size=float(o["q"]),
+                price=float(o["p"]),
+                timestamp=float(o["T"]) / 1000,
+            )
+        except (KeyError, ValueError):
+            return None
+
+    async def _oi_poller(self, symbols: list[str], queue: asyncio.Queue) -> None:
+        """Poll Binance REST API for open interest."""
+        ds = self._settings.data_streams if self._settings else None
+        interval = ds.oi_poll_interval_s if ds else 60
+        async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
+            while self._running:
+                try:
+                    for sym in symbols:
+                        if not self._running:
+                            break
+                        try:
+                            resp = await client.get(
+                                "/fapi/v1/openInterest",
+                                params={"symbol": sym},
+                            )
+                            if resp.status_code != 200:
+                                continue
+                            data = resp.json()
+                            oi = float(data.get("openInterest", 0))
+                            # We don't have USD value directly, use 0 (engine will use oi)
+                            await queue.put(OpenInterestMessage(
+                                exchange="binance",
+                                symbol=sym,
+                                open_interest=oi,
+                                open_interest_value=0,
+                                timestamp=time(),
+                            ))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.05)  # rate limit: ~20 req/s
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    logger.exception("Binance OI poller error")
+                await asyncio.sleep(interval)
+
+    async def _long_short_ratio_poller(
+        self, symbols: list[str], queue: asyncio.Queue
+    ) -> None:
+        """Poll Binance REST API for long/short ratio."""
+        ds = self._settings.data_streams if self._settings else None
+        interval = ds.ls_ratio_poll_interval_s if ds else 300
+        async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
+            while self._running:
+                try:
+                    for sym in symbols:
+                        if not self._running:
+                            break
+                        try:
+                            resp = await client.get(
+                                "/futures/data/globalLongShortAccountRatio",
+                                params={"symbol": sym, "period": "5m", "limit": 1},
+                            )
+                            if resp.status_code != 200:
+                                continue
+                            data = resp.json()
+                            if data:
+                                ratio = float(data[0].get("longShortRatio", 0))
+                                await queue.put(LongShortRatioMessage(
+                                    exchange="binance",
+                                    symbol=sym,
+                                    long_short_ratio=round(ratio, 4),
+                                    timestamp=time(),
+                                ))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.1)
+                except asyncio.CancelledError:
+                    return
+                except Exception:
+                    logger.exception("Binance L/S ratio poller error")
+                await asyncio.sleep(interval)
 
     async def stop(self) -> None:
         self._running = False
