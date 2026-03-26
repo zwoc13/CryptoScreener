@@ -8,3 +8,6 @@ services:
     environment:
       - SCREENER_TELEGRAM_TOKEN=${SCREENER_TELEGRAM_TOKEN:-}
     restart: unless-stopped
+    stdin_open: true  # docker run -i
+    tty: true         # docker run -t
+    command: ["uv", "run", "python", "-m", "screener", "--mode", "both"]
