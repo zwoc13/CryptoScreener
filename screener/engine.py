@@ -11,6 +11,9 @@ from .models import (
     FundingAlert,
     ImpulseEvent,
     KlineMessage,
+    LiquidationMessage,
+    LongShortRatioMessage,
+    OpenInterestMessage,
     TickerMessage,
     TickerState,
     TradeMessage,
@@ -48,6 +51,12 @@ class Engine:
                     self._handle_kline(msg)
                 elif isinstance(msg, TradeMessage):
                     self._handle_trade(msg)
+                elif isinstance(msg, OpenInterestMessage):
+                    self._handle_open_interest(msg)
+                elif isinstance(msg, LiquidationMessage):
+                    self._handle_liquidation(msg)
+                elif isinstance(msg, LongShortRatioMessage):
+                    self._handle_long_short_ratio(msg)
             except Exception:
                 logger.exception("Engine error processing message")
             finally:

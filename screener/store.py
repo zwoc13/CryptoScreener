@@ -19,6 +19,14 @@ class CvdBucket:
     delta: float = 0.0  # buy_vol - sell_vol in this second
 
 
+@dataclass
+class LiqBucket:
+    """One-second liquidation bucket."""
+    timestamp: int  # truncated epoch second
+    buy_liq_usd: float = 0.0  # USD vol of long liquidations
+    sell_liq_usd: float = 0.0  # USD vol of short liquidations
+
+
 class Store:
     def __init__(self, natr_period: int = 14) -> None:
         self._tickers: dict[str, TickerState] = {}
@@ -31,6 +39,10 @@ class Store:
         self._cvd_buckets: dict[str, deque[CvdBucket]] = {}
         # CVD daily accumulator (reset at 2 AM)
         self._cvd_daily: dict[str, float] = {}
+        # Liquidation: per-symbol ring buffer of 1-second buckets (1 hour)
+        self._liq_buckets: dict[str, deque[LiqBucket]] = {}
+        # OI snapshots: per-symbol ring buffer of (timestamp, oi_value) for 5m change
+        self._oi_snapshots: dict[str, deque[tuple[float, float]]] = {}
 
     def get_or_create_ticker(self, exchange: str, symbol: str) -> TickerState:
         k = _key(exchange, symbol)
@@ -97,6 +109,74 @@ class Store:
 
     def get_cvd_daily(self, exchange: str, symbol: str) -> float:
         return self._cvd_daily.get(_key(exchange, symbol), 0.0)
+
+    # -- Liquidations --
+
+    def add_liquidation(
+        self, exchange: str, symbol: str, side: str, usd_vol: float, ts: float
+    ) -> None:
+        k = _key(exchange, symbol)
+        buckets = self._liq_buckets.get(k)
+        if buckets is None:
+            buckets = deque(maxlen=3600)
+            self._liq_buckets[k] = buckets
+
+        sec = int(ts)
+        if buckets and buckets[-1].timestamp == sec:
+            bucket = buckets[-1]
+        else:
+            bucket = LiqBucket(timestamp=sec)
+            buckets.append(bucket)
+
+        if side == "Buy":
+            bucket.buy_liq_usd += usd_vol
+        else:
+            bucket.sell_liq_usd += usd_vol
+
+    def get_liq_rolling(
+        self, exchange: str, symbol: str, window_seconds: int
+    ) -> tuple[float, float]:
+        k = _key(exchange, symbol)
+        buckets = self._liq_buckets.get(k)
+        if not buckets:
+            return 0.0, 0.0
+        cutoff = int(time()) - window_seconds
+        buy_total = 0.0
+        sell_total = 0.0
+        for b in buckets:
+            if b.timestamp >= cutoff:
+                buy_total += b.buy_liq_usd
+                sell_total += b.sell_liq_usd
+        return buy_total, sell_total
+
+    # -- Open Interest snapshots --
+
+    def update_open_interest(
+        self, exchange: str, symbol: str, oi_value: float, ts: float
+    ) -> None:
+        k = _key(exchange, symbol)
+        snaps = self._oi_snapshots.get(k)
+        if snaps is None:
+            snaps = deque(maxlen=360)
+            self._oi_snapshots[k] = snaps
+        snaps.append((ts, oi_value))
+
+    def get_oi_change_5m_pct(self, exchange: str, symbol: str) -> float:
+        k = _key(exchange, symbol)
+        snaps = self._oi_snapshots.get(k)
+        if not snaps or len(snaps) < 2:
+            return 0.0
+        current = snaps[-1][1]
+        cutoff = time() - 300
+        oldest = current
+        for ts, val in snaps:
+            if ts <= cutoff:
+                oldest = val
+            else:
+                break
+        if oldest == 0:
+            return 0.0
+        return ((current - oldest) / oldest) * 100
 
     # -- Daily reset --
 
