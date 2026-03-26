@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import deque
 from datetime import datetime
 from time import time
@@ -8,11 +9,11 @@ from zoneinfo import ZoneInfo
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Header, Input, Static
+from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from .alerts import AlertEvent
 from .config import Settings
-from .models import FundingAlert, ImpulseEvent, LargeOrderEvent, OrderEatenEvent, TickerState
+from .models import FundingAlert, ImpulseEvent, LargeOrderEvent, NewsEvent, OrderEatenEvent, TickerState
 from .store import Store
 
 # Column definitions: (label, sort_field)
@@ -24,13 +25,13 @@ COLUMNS: list[tuple[str, str]] = [
     ("Change %", "daily_change_pct"),
     ("CVD 5m", "_cvd_5m"),
     ("CVD 1h", "_cvd_1h"),
-    ("Range 1m", "range_1m"),
-    ("Range 5m", "range_5m"),
+    ("CVD Day", "_cvd_daily"),
+    ("Liq Net 5m", "_liq_net_5m"),
     ("NATR 5/14", "natr_5m_14"),
-    ("Vol 24h", "volume_24h"),
+    ("OI Chg 5m", "oi_change_5m_pct"),
     ("Fund %", "funding_rate"),
     ("Fund In", "next_funding_ts"),
-    ("Fund Int", "funding_interval_h"),
+    ("Buy% 1m", "_trade_imb_1m"),
 ]
 
 
@@ -169,6 +170,109 @@ class LargeOrderPanel(Static):
         self.update("\n".join(lines))
 
 
+class NewsPanel(Static):
+    """Shows recent news events (delistings, new listings)."""
+
+    DEFAULT_CSS = """
+    NewsPanel {
+        height: auto;
+        max-height: 10;
+        overflow-y: auto;
+        padding: 0 1;
+        border-top: solid $surface-lighten-2;
+    }
+    """
+
+    def __init__(self, alerts: deque[AlertEvent], timezone: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._alerts = alerts
+        self._tz = ZoneInfo(timezone)
+        self._last_count = 0
+
+    def refresh_news(self) -> None:
+        count = len(self._alerts)
+        if count == self._last_count:
+            return
+        self._last_count = count
+
+        lines: list[str] = ["[bold underline]News[/bold underline]\n"]
+        news_count = 0
+
+        for event in self._alerts:
+            if not isinstance(event, NewsEvent):
+                continue
+            news_count += 1
+            ts = datetime.fromtimestamp(event.timestamp, tz=self._tz)
+            time_str = ts.strftime("%H:%M:%S")
+
+            if event.news_type == "delisting":
+                icon = "[bold red]DELIST[/]"
+            elif event.news_type == "new_listing":
+                icon = "[bold green]LISTING[/]"
+            else:
+                icon = f"[yellow]{event.news_type.upper()}[/]"
+
+            symbols_str = ", ".join(event.symbols[:5]) if event.symbols else ""
+            if len(event.symbols) > 5:
+                symbols_str += f" +{len(event.symbols) - 5}"
+
+            lines.append(f"[dim]{time_str}[/dim] {icon}  [bold]{symbols_str}[/bold]")
+            if event.title:
+                lines.append(f"         [dim]{event.title[:60]}[/dim]")
+            lines.append("")
+
+        if news_count == 0:
+            lines.append("[dim]No news yet...[/dim]")
+
+        self.update("\n".join(lines))
+
+
+class _TuiLogHandler(logging.Handler):
+    """Routes log records to a RichLog widget inside the TUI."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._widget: RichLog | None = None
+        self._buffer: list[str] = []
+
+    def attach(self, widget: RichLog) -> None:
+        self._widget = widget
+        for msg in self._buffer:
+            self._widget.write(msg)
+        self._buffer.clear()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            color = {"DEBUG": "dim", "INFO": "white", "WARNING": "yellow",
+                     "ERROR": "red", "CRITICAL": "bold red"}.get(record.levelname, "white")
+            formatted = f"[{color}]{msg}[/]"
+            if self._widget is not None:
+                self._widget.write(formatted)
+            else:
+                self._buffer.append(formatted)
+                if len(self._buffer) > 300:
+                    self._buffer = self._buffer[-150:]
+        except Exception:
+            pass
+
+
+# Global handler — installed before app starts so early logs are captured
+tui_log_handler = _TuiLogHandler()
+tui_log_handler.setFormatter(logging.Formatter("%(asctime)s %(name)-12s %(levelname)-8s %(message)s", datefmt="%H:%M:%S"))
+
+
+def install_tui_logging() -> None:
+    """Replace stderr logging with the TUI handler. Call before app.run()."""
+    root = logging.getLogger()
+    # Remove all stderr/stdout handlers
+    for h in list(root.handlers):
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            root.removeHandler(h)
+    if tui_log_handler not in root.handlers:
+        root.addHandler(tui_log_handler)
+
+
 class ScreenerApp(App):
     CSS = """
     Screen {
@@ -184,10 +288,18 @@ class ScreenerApp(App):
         width: 1fr;
     }
     #alert-pane {
-        height: 1fr;
+        height: 2fr;
+    }
+    #news-pane {
+        height: auto;
+        max-height: 10;
     }
     #ob-pane {
         height: 1fr;
+    }
+    #log-pane {
+        height: 1fr;
+        border-top: solid $surface-lighten-2;
     }
     #status-bar {
         dock: bottom;
@@ -259,16 +371,26 @@ class ScreenerApp(App):
                     self._settings.schedule.timezone,
                     id="alert-pane",
                 )
+                yield NewsPanel(
+                    self._alert_history,
+                    self._settings.schedule.timezone,
+                    id="news-pane",
+                )
                 yield LargeOrderPanel(
                     self._large_orders,
                     self._settings.schedule.timezone,
                     id="ob-pane",
                 )
+                yield RichLog(id="log-pane", wrap=True, markup=True)
         yield Input(placeholder="Search ticker...", id="search-bar")
         yield StatusBar(id="status-bar")
         yield Footer()
 
     def on_mount(self) -> None:
+        # Attach log handler to the RichLog widget
+        log_widget = self.query_one("#log-pane", RichLog)
+        tui_log_handler.attach(log_widget)
+
         table = self.query_one("#table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
@@ -285,7 +407,12 @@ class ScreenerApp(App):
     def _refresh_all(self) -> None:
         self._refresh_table()
         self._refresh_alerts()
+        self._refresh_news()
         self._refresh_large_orders()
+
+    def _refresh_news(self) -> None:
+        panel = self.query_one("#news-pane", NewsPanel)
+        panel.refresh_news()
 
     def _refresh_alerts(self) -> None:
         panel = self.query_one("#alert-pane", AlertPanel)
@@ -309,9 +436,13 @@ class ScreenerApp(App):
         cvd_cache: dict[str, dict[str, float]] = {}
         for t in tickers:
             k = f"{t.exchange}:{t.symbol}"
+            liq_buy, liq_sell = self._store.get_liq_rolling(t.exchange, t.symbol, 300)
             cvd_cache[k] = {
                 "_cvd_5m": self._store.get_cvd_rolling(t.exchange, t.symbol, 300),
                 "_cvd_1h": self._store.get_cvd_rolling(t.exchange, t.symbol, 3600),
+                "_cvd_daily": self._store.get_cvd_daily(t.exchange, t.symbol),
+                "_liq_net_5m": liq_sell - liq_buy,
+                "_trade_imb_1m": self._store.get_trade_imbalance(t.exchange, t.symbol, 60),
             }
 
         tickers.sort(
@@ -327,7 +458,7 @@ class ScreenerApp(App):
                 break
             k = f"{t.exchange}:{t.symbol}"
             visible_keys.add(k)
-            cvd = cvd_cache.get(k, {"_cvd_5m": 0, "_cvd_1h": 0})
+            cvd = cvd_cache.get(k, {"_cvd_5m": 0, "_cvd_1h": 0, "_cvd_daily": 0, "_liq_net_5m": 0, "_trade_imb_1m": 0.5})
             row_data = (
                 t.exchange.upper(),
                 t.symbol,
@@ -335,13 +466,13 @@ class ScreenerApp(App):
                 _color_pct(t.daily_change_pct),
                 _color_cvd(cvd["_cvd_5m"]),
                 _color_cvd(cvd["_cvd_1h"]),
-                _fmt_price(t.range_1m),
-                _fmt_price(t.range_5m),
+                _color_cvd(cvd["_cvd_daily"]),
+                _color_cvd(cvd["_liq_net_5m"]),
                 f"{t.natr_5m_14:.1f}" if t.natr_5m_14 > 0 else "-",
-                _fmt_volume(t.volume_24h),
+                _color_pct(t.oi_change_5m_pct),
                 _color_funding(t.funding_rate),
                 _fmt_funding_countdown(t.next_funding_ts),
-                f"{t.funding_interval_h}h" if t.funding_interval_h else "-",
+                _color_imbalance(cvd["_trade_imb_1m"]),
             )
 
             if k in self._row_keys:
@@ -509,6 +640,16 @@ def _color_cvd(val: float) -> str:
     return f"[red]-{_fmt_volume(abs(val))}[/red]"
 
 
+def _color_imbalance(val: float) -> str:
+    """Format trade imbalance 0.0–1.0 as colored buy%. >=60% green, <=40% red."""
+    pct = val * 100
+    if pct >= 60:
+        return f"[green]{pct:.0f}%[/green]"
+    if pct <= 40:
+        return f"[red]{pct:.0f}%[/red]"
+    return f"{pct:.0f}%"
+
+
 def _color_pct(val: float) -> str:
     if val > 0:
         return f"[green]+{val:.1f}[/green]"
@@ -537,11 +678,15 @@ def _fmt_price(val: float) -> str:
 
 def _fmt_volume(v: float) -> str:
     if v >= 1_000_000_000:
-        return f"{v / 1_000_000_000:.1f}B"
+        return f"{v / 1_000_000_000:.2f}B"
+    if v >= 100_000_000:
+        return f"[bold]{v / 1_000_000:.1f}M[/bold]"
     if v >= 1_000_000:
-        return f"[bold]{v / 1_000_000:.0f}M[/bold]" if v >= 100_000_000 else f"{v / 1_000_000:.0f}M"
+        return f"{v / 1_000_000:.2f}M"
+    if v >= 100_000:
+        return f"{v / 1_000:.1f}K"
     if v >= 1_000:
-        return f"{v / 1_000:.0f}K"
+        return f"{v / 1_000:.2f}K"
     return f"{v:.0f}"
 
 

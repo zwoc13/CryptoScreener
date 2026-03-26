@@ -17,6 +17,8 @@ class CvdBucket:
     """One-second CVD bucket."""
     timestamp: int  # truncated epoch second
     delta: float = 0.0  # buy_vol - sell_vol in this second
+    buy_vol: float = 0.0
+    sell_vol: float = 0.0
 
 
 @dataclass
@@ -94,7 +96,7 @@ class Store:
 
     # -- CVD (Cumulative Volume Delta) --
 
-    def add_trade_delta(self, exchange: str, symbol: str, delta: float, ts: float) -> None:
+    def add_trade_delta(self, exchange: str, symbol: str, delta: float, usd_size: float, ts: float) -> None:
         k = _key(exchange, symbol)
         buckets = self._cvd_buckets.get(k)
         if buckets is None:
@@ -103,9 +105,16 @@ class Store:
 
         sec = int(ts)
         if buckets and buckets[-1].timestamp == sec:
-            buckets[-1].delta += delta
+            b = buckets[-1]
+            b.delta += delta
+            if delta > 0:
+                b.buy_vol += usd_size
+            else:
+                b.sell_vol += usd_size
         else:
-            buckets.append(CvdBucket(timestamp=sec, delta=delta))
+            buy_vol = usd_size if delta > 0 else 0.0
+            sell_vol = usd_size if delta <= 0 else 0.0
+            buckets.append(CvdBucket(timestamp=sec, delta=delta, buy_vol=buy_vol, sell_vol=sell_vol))
 
         # Daily accumulator
         self._cvd_daily[k] = self._cvd_daily.get(k, 0.0) + delta
@@ -120,6 +129,21 @@ class Store:
 
     def get_cvd_daily(self, exchange: str, symbol: str) -> float:
         return self._cvd_daily.get(_key(exchange, symbol), 0.0)
+
+    def get_trade_imbalance(self, exchange: str, symbol: str, window_seconds: int) -> float:
+        """Returns buy_vol / total_vol in [0.0, 1.0]. 0.5 = balanced."""
+        k = _key(exchange, symbol)
+        buckets = self._cvd_buckets.get(k)
+        if not buckets:
+            return 0.5
+        cutoff = int(time()) - window_seconds
+        buy = sell = 0.0
+        for b in buckets:
+            if b.timestamp >= cutoff:
+                buy += b.buy_vol
+                sell += b.sell_vol
+        total = buy + sell
+        return buy / total if total > 0 else 0.5
 
     # -- Liquidations --
 

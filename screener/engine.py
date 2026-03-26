@@ -128,8 +128,9 @@ class Engine:
 
     def _handle_trade(self, msg: TradeMessage) -> None:
         self._store.touch()
-        delta = msg.size if msg.side == "Buy" else -msg.size
-        self._store.add_trade_delta(msg.exchange, msg.symbol, delta, msg.timestamp)
+        usd_size = msg.size * msg.price
+        delta = usd_size if msg.side == "Buy" else -usd_size
+        self._store.add_trade_delta(msg.exchange, msg.symbol, delta, usd_size, msg.timestamp)
 
     def _handle_open_interest(self, msg: OpenInterestMessage) -> None:
         self._store.touch()

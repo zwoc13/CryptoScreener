@@ -210,6 +210,11 @@ def cli() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # When TUI is active, redirect logs from stderr into the TUI log panel
+    if args.mode in ("tui", "both"):
+        from .tui import install_tui_logging
+        install_tui_logging()
+
     if args.mode == "client":
         from .client import run_client
         settings = load_settings(args.config)

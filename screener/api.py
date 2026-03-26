@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from .alerts import AlertEvent
+from .bus import EventBus
 from .store import Store
 
 
@@ -40,31 +41,6 @@ def _ticker_dict(store: Store, t) -> dict:
         "long_short_ratio": t.long_short_ratio,
         "delist_ts": t.delist_ts,
     }
-
-
-class EventBus:
-    """Simple async broadcast: multiple SSE clients receive every event."""
-
-    def __init__(self) -> None:
-        self._subscribers: list[asyncio.Queue] = []
-
-    def subscribe(self) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=256)
-        self._subscribers.append(q)
-        return q
-
-    def unsubscribe(self, q: asyncio.Queue) -> None:
-        try:
-            self._subscribers.remove(q)
-        except ValueError:
-            pass
-
-    def publish(self, event: AlertEvent) -> None:
-        for q in self._subscribers:
-            try:
-                q.put_nowait(event)
-            except asyncio.QueueFull:
-                pass  # slow client, drop event
 
 
 def create_api(

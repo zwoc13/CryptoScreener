@@ -209,3 +209,10 @@ class NewsEvent:
     symbols: list[str] = field(default_factory=list)  # affected symbols (raw)
     feed_ids: list[str] = field(default_factory=list)  # CCXT format
     timestamp: float = field(default_factory=time)
+
+
+# ── Compatibility aliases for types that botctl defined separately ──────────
+# These allow trading bots to keep using the old names.
+FundingEvent = FundingAlert
+ScreenerEvent = ImpulseEvent | FundingAlert | LargeOrderEvent | OrderEatenEvent | NewsEvent
+TickerData = TickerState  # bots used TickerData; in unified app they get the full TickerState

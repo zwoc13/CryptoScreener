@@ -1,5 +1,6 @@
 services:
   screener:
+    container_name: screener
     build: .
     ports:
       - "8000:8000"
