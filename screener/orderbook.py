@@ -6,7 +6,7 @@ from collections import deque
 from time import time
 from typing import TYPE_CHECKING
 
-from .models import LargeOrderEvent, OrderEatenEvent
+from .models import LargeOrderEvent, OrderEatenEvent, to_feed_id
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -113,6 +113,7 @@ class OrderbookManager:
                 current[(side_name, price)] = LargeOrderEvent(
                     exchange=exchange,
                     symbol=symbol,
+                    feed_id=to_feed_id(symbol),
                     side=side_name,
                     price=price,
                     size_usd=size_usd,
@@ -158,6 +159,7 @@ class OrderbookManager:
         eaten = OrderEatenEvent(
             exchange=exchange,
             symbol=symbol,
+            feed_id=to_feed_id(symbol),
             side=old_event.side,
             price=old_event.price,
             size_usd=old_event.size_usd,

@@ -71,10 +71,11 @@ async def run(mode: str) -> None:
         all_symbols[ex.name] = symbols
         logger.info("%s: %d symbols", ex.name, len(symbols))
 
-    # Warmup klines for NATR
+    # Warmup klines for NATR + 4h range (need 48 candles for 4h range)
+    warmup_limit = max(settings.natr.period + 1, 50)
     for ex in exchanges:
         syms = all_symbols.get(ex.name, [])
-        await warmup_klines(ex, syms, settings.natr.interval, settings.natr.period + 1, store)
+        await warmup_klines(ex, syms, settings.natr.interval, warmup_limit, store)
 
     # Initialize engine, alert dispatcher, and orderbook manager
     from .api import EventBus
@@ -87,14 +88,16 @@ async def run(mode: str) -> None:
         from .orderbook import OrderbookManager
         ob_manager = OrderbookManager(store, alert_queue, settings)
 
-    # Compute initial NATR from warmup candles
+    # Compute initial NATR and ranges from warmup candles
     for ex in exchanges:
         for sym in all_symbols.get(ex.name, []):
             natr = engine._compute_natr(ex.name, sym)
+            ticker = store.get_or_create_ticker(ex.name, sym)
             if natr is not None:
-                ticker = store.get_or_create_ticker(ex.name, sym)
                 ticker.natr_5m_14 = natr
-    logger.info("Initial NATR computed for all symbols with sufficient candle history")
+            ticker.range_1h = store.get_range(ex.name, sym, 12)
+            ticker.range_4h = store.get_range(ex.name, sym, 48)
+    logger.info("Initial NATR and ranges computed from warmup candles")
 
     # Build list of async tasks
     tasks: list[asyncio.Task] = []
@@ -115,6 +118,14 @@ async def run(mode: str) -> None:
 
     # Scheduler
     tasks.append(asyncio.create_task(run_daily_reset(store, settings), name="scheduler"))
+
+    # News poller (delistings, new listings)
+    if settings.news.enabled:
+        from .news import run_news_poller
+        tasks.append(asyncio.create_task(
+            run_news_poller(alert_queue, settings, store),
+            name="news-poller",
+        ))
 
     # API server
     exchange_map = {ex.name: ex for ex in exchanges}

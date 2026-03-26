@@ -9,11 +9,11 @@ from time import time
 import httpx
 
 from .config import Settings
-from .models import FundingAlert, ImpulseEvent, LargeOrderEvent, OrderEatenEvent
+from .models import FundingAlert, ImpulseEvent, LargeOrderEvent, NewsEvent, OrderEatenEvent
 
 logger = logging.getLogger(__name__)
 
-AlertEvent = ImpulseEvent | FundingAlert | LargeOrderEvent | OrderEatenEvent
+AlertEvent = ImpulseEvent | FundingAlert | LargeOrderEvent | OrderEatenEvent | NewsEvent
 
 
 class AlertDispatcher:
@@ -52,11 +52,16 @@ class AlertDispatcher:
             alert_type = "large_order"
         elif isinstance(event, OrderEatenEvent):
             alert_type = "order_eaten"
+        elif isinstance(event, NewsEvent):
+            alert_type = "news"
         else:
             return
 
-        # Check cooldown
-        key = f"{event.exchange}:{event.symbol}:{alert_type}"
+        # Check cooldown (news uses URL as unique key)
+        if isinstance(event, NewsEvent):
+            key = f"news:{event.url}"
+        else:
+            key = f"{event.exchange}:{event.symbol}:{alert_type}"
         now = time()
         cooldown = self._settings.alerts.cooldown_seconds
         last = self._cooldowns.get(key, 0)
@@ -101,7 +106,8 @@ class AlertDispatcher:
             try:
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code < 400:
-                    logger.info("Webhook sent to %s: %s %s", url, alert_type, event.symbol)
+                    sym = getattr(event, "symbol", getattr(event, "news_type", ""))
+                    logger.info("Webhook sent to %s: %s %s", url, alert_type, sym)
                     return
                 logger.warning("Webhook %s returned %d", url, resp.status_code)
             except Exception as e:
@@ -129,7 +135,8 @@ class AlertDispatcher:
                 try:
                     resp = await client.post(url, json=payload)
                     if resp.status_code < 400:
-                        logger.info("Telegram sent to %s: %s", chat_id, event.symbol)
+                        sym = getattr(event, "symbol", getattr(event, "news_type", ""))
+                        logger.info("Telegram sent to %s: %s", chat_id, sym)
                         return
                     logger.warning("Telegram %s returned %d", chat_id, resp.status_code)
                 except Exception as e:
@@ -146,7 +153,7 @@ class AlertDispatcher:
                 f"Price: `{event.price}`  |  Daily: `{event.daily_change_pct:+.2f}%`",
                 f"NATR: `{event.natr_value}`  |  Trend: `{event.trend}`",
                 f"CVD 5m/1h/D: `{event.cvd_5m}` / `{event.cvd_1h}` / `{event.cvd_daily}`",
-                f"Range 1m/5m: `{event.range_1m}` / `{event.range_5m}`",
+                f"Range 1m/5m/1h/4h: `{event.range_1m}` / `{event.range_5m}` / `{event.range_1h}` / `{event.range_4h}`",
                 f"Funding: `{event.funding_rate * 100:.4f}%`",
                 f"Vol 24h: `{_fmt_volume(event.volume_24h)}`",
             ]
@@ -182,6 +189,24 @@ class AlertDispatcher:
                 f"*{event.symbol}* likely {status}\n"
                 f"Size: `${_fmt_volume(event.size_usd)}` @ `{event.price}`\n"
                 f"Last: `{event.last_price}`"
+            )
+        elif isinstance(event, NewsEvent):
+            label = "Delisting" if event.news_type == "delisting" else "New Listing"
+            sym_lines = ""
+            if event.symbols:
+                pairs = [f"{s} ({f})" for s, f in zip(event.symbols, event.feed_ids)]
+                sym_lines = "\n".join(pairs) + "\n"
+            time_info = ""
+            if event.event_ts > 0:
+                from datetime import datetime, timezone
+                dt = datetime.fromtimestamp(event.event_ts, tz=timezone.utc)
+                time_info = f"Date: `{dt.strftime('%Y-%m-%d %H:%M')} UTC`\n"
+            return (
+                f"*{label}* `{event.exchange.upper()}`\n"
+                f"{sym_lines}"
+                f"{time_info}"
+                f"{event.title}\n"
+                f"[Read more]({event.url})"
             )
         return str(event)
 

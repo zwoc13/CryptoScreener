@@ -126,8 +126,6 @@ class BybitExchange(BaseExchange):
             bucket = i % n_conns
             ticker_kline_topics[bucket].append(f"tickers.{sym}")
             ticker_kline_topics[bucket].append(f"kline.5.{sym}")
-            if ds and ds.liquidations_enabled:
-                ticker_kline_topics[bucket].append(f"liquidation.{sym}")
 
         conn_id = 0
         for topics in ticker_kline_topics:
@@ -147,6 +145,20 @@ class BybitExchange(BaseExchange):
             for topics in trade_topics:
                 task = asyncio.create_task(
                     self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-trade-{conn_id}"
+                )
+                self._ws_tasks.append(task)
+                conn_id += 1
+
+        # Liquidation stream connections (dedicated, separate from ticker/kline)
+        if ds and ds.liquidations_enabled:
+            n_liq_conns = 2
+            liq_topics: list[list[str]] = [[] for _ in range(n_liq_conns)]
+            for i, sym in enumerate(symbols):
+                liq_topics[i % n_liq_conns].append(f"liquidation.{sym}")
+
+            for topics in liq_topics:
+                task = asyncio.create_task(
+                    self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-liq-{conn_id}"
                 )
                 self._ws_tasks.append(task)
                 conn_id += 1
@@ -376,34 +388,39 @@ class BybitExchange(BaseExchange):
         """Poll Bybit REST API for long/short ratio every N seconds."""
         ds = self._settings.data_streams if self._settings else None
         interval = ds.ls_ratio_poll_interval_s if ds else 300
+        semaphore = asyncio.Semaphore(10)  # max 10 concurrent requests
+
+        async def fetch_one(client: httpx.AsyncClient, sym: str) -> None:
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        "/v5/market/account-ratio",
+                        params={"category": "linear", "symbol": sym, "period": "5min", "limit": 1},
+                    )
+                    if resp.status_code != 200:
+                        return
+                    data = resp.json()
+                    items = data.get("result", {}).get("list", [])
+                    if items:
+                        ratio = float(items[0].get("buyRatio", 0)) / max(
+                            float(items[0].get("sellRatio", 1)), 0.0001
+                        )
+                        await queue.put(LongShortRatioMessage(
+                            exchange="bybit",
+                            symbol=sym,
+                            long_short_ratio=round(ratio, 4),
+                            timestamp=time(),
+                        ))
+                except Exception:
+                    pass
+
         async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
             while self._running:
                 try:
-                    for sym in symbols:
-                        if not self._running:
-                            break
-                        try:
-                            resp = await client.get(
-                                "/v5/market/account-ratio",
-                                params={"category": "linear", "symbol": sym, "period": "5min", "limit": 1},
-                            )
-                            if resp.status_code != 200:
-                                continue
-                            data = resp.json()
-                            items = data.get("result", {}).get("list", [])
-                            if items:
-                                ratio = float(items[0].get("buyRatio", 0)) / max(
-                                    float(items[0].get("sellRatio", 1)), 0.0001
-                                )
-                                await queue.put(LongShortRatioMessage(
-                                    exchange="bybit",
-                                    symbol=sym,
-                                    long_short_ratio=round(ratio, 4),
-                                    timestamp=time(),
-                                ))
-                        except Exception:
-                            pass  # skip individual symbol errors
-                        await asyncio.sleep(0.1)  # rate limit protection
+                    await asyncio.gather(
+                        *(fetch_one(client, sym) for sym in symbols),
+                        return_exceptions=True,
+                    )
                 except asyncio.CancelledError:
                     return
                 except Exception:

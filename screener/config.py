@@ -27,6 +27,7 @@ class NatrConfig(BaseModel):
 
 class FundingConfig(BaseModel):
     alert_threshold: float = 0.01
+    repeat_interval_s: int = 300  # re-send funding alert every N seconds while above threshold
 
 
 class WebhookTarget(BaseModel):
@@ -76,6 +77,12 @@ class DataStreamsConfig(BaseModel):
     oi_poll_interval_s: int = 60  # for Binance REST polling
 
 
+class NewsConfig(BaseModel):
+    enabled: bool = True
+    poll_interval_s: int = 300  # check every 5 minutes
+    lookback_hours: int = 72  # only alert on announcements from last 72h
+
+
 class ApiConfig(BaseModel):
     port: int = 8000
     host: str = "0.0.0.0"
@@ -92,6 +99,7 @@ class Settings(BaseModel):
     api: ApiConfig = Field(default_factory=ApiConfig)
     orderbook: OrderbookConfig = Field(default_factory=OrderbookConfig)
     data_streams: DataStreamsConfig = Field(default_factory=DataStreamsConfig)
+    news: NewsConfig = Field(default_factory=NewsConfig)
 
 
 def load_settings(path: str | Path = "config.yaml") -> Settings:

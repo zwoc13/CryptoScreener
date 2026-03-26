@@ -18,6 +18,7 @@ def _ticker_dict(store: Store, t) -> dict:
     return {
         "exchange": t.exchange,
         "symbol": t.symbol,
+        "feed_id": t.feed_id,
         "trend": t.trend,
         "daily_change_pct": round(t.daily_change_pct, 2),
         "cvd_5m": round(store.get_cvd_rolling(t.exchange, t.symbol, 300), 2),
@@ -25,6 +26,8 @@ def _ticker_dict(store: Store, t) -> dict:
         "cvd_daily": round(store.get_cvd_daily(t.exchange, t.symbol), 2),
         "range_1m": t.range_1m,
         "range_5m": t.range_5m,
+        "range_1h": t.range_1h,
+        "range_4h": t.range_4h,
         "natr_5m_14": round(t.natr_5m_14, 4),
         "volume_24h": t.volume_24h,
         "funding_rate": t.funding_rate,
@@ -35,6 +38,7 @@ def _ticker_dict(store: Store, t) -> dict:
         "open_interest": t.open_interest,
         "oi_change_5m_pct": round(t.oi_change_5m_pct, 2),
         "long_short_ratio": t.long_short_ratio,
+        "delist_ts": t.delist_ts,
     }
 
 
@@ -138,7 +142,7 @@ def create_api(
                 while True:
                     event = await q.get()
                     # Determine event type name
-                    from .models import ImpulseEvent, FundingAlert, LargeOrderEvent, OrderEatenEvent
+                    from .models import ImpulseEvent, FundingAlert, LargeOrderEvent, OrderEatenEvent, NewsEvent
                     if isinstance(event, ImpulseEvent):
                         etype = "impulse"
                     elif isinstance(event, FundingAlert):
@@ -147,6 +151,8 @@ def create_api(
                         etype = "large_order"
                     elif isinstance(event, OrderEatenEvent):
                         etype = "order_eaten"
+                    elif isinstance(event, NewsEvent):
+                        etype = "news"
                     else:
                         etype = "unknown"
 

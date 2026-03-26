@@ -37,8 +37,8 @@ class Engine:
         self._price_history: dict[str, deque[tuple[float, float]]] = {}
         # Per-symbol impulse cooldown: key -> timestamp of last impulse alert
         self._impulse_cooldown: dict[str, float] = {}
-        # Track last funding rate alert per symbol to avoid repeat alerts
-        self._last_funding_alert: dict[str, float] = {}
+        # Track last funding alert timestamp per symbol
+        self._last_funding_alert_ts: dict[str, float] = {}
 
     async def run(self, msg_queue: asyncio.Queue) -> None:
         logger.info("Engine started")
@@ -117,12 +117,14 @@ class Engine:
             # Update range_5m from latest candle
             ticker.range_5m = msg.candle.high - msg.candle.low
 
-            # Recompute NATR and trend when candle is confirmed
+            # Recompute NATR, trend, and ranges when candle is confirmed
             if msg.candle.confirmed:
                 natr = self._compute_natr(msg.exchange, msg.symbol)
                 if natr is not None:
                     ticker.natr_5m_14 = natr
                 ticker.trend = self._compute_trend(msg.exchange, msg.symbol)
+                ticker.range_1h = self._store.get_range(msg.exchange, msg.symbol, 12)
+                ticker.range_4h = self._store.get_range(msg.exchange, msg.symbol, 48)
 
     def _handle_trade(self, msg: TradeMessage) -> None:
         self._store.touch()
@@ -275,6 +277,7 @@ class Engine:
             event = ImpulseEvent(
                 exchange=ticker.exchange,
                 symbol=ticker.symbol,
+                feed_id=ticker.feed_id,
                 direction=direction,
                 change_pct=round(change_pct, 2),
                 natr_value=round(ticker.natr_5m_14, 4),
@@ -288,6 +291,8 @@ class Engine:
                 daily_change_pct=round(ticker.daily_change_pct, 2),
                 range_1m=ticker.range_1m,
                 range_5m=ticker.range_5m,
+                range_1h=ticker.range_1h,
+                range_4h=ticker.range_4h,
                 open_interest=ticker.open_interest,
                 oi_change_5m_pct=round(ticker.oi_change_5m_pct, 2),
                 liq_buys_5m=round(liq_buys, 2),
@@ -307,14 +312,17 @@ class Engine:
             return
 
         key = f"{ticker.exchange}:{ticker.symbol}"
-        last = self._last_funding_alert.get(key, 0.0)
-        if last == rate:
+        now = time()
+        repeat_interval = self._settings.funding.repeat_interval_s
+        last_ts = self._last_funding_alert_ts.get(key, 0.0)
+        if now - last_ts < repeat_interval:
             return
-        self._last_funding_alert[key] = rate
+        self._last_funding_alert_ts[key] = now
 
         alert = FundingAlert(
             exchange=ticker.exchange,
             symbol=ticker.symbol,
+            feed_id=ticker.feed_id,
             rate=rate,
             price=ticker.last_price,
         )

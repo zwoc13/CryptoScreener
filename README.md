@@ -1,6 +1,6 @@
 # Crypto Futures Screener
 
-A real-time terminal screener for cryptocurrency perpetual futures. Tracks every USDT-margined perpetual on Bybit (578+ symbols) via WebSocket, displays live metrics in a sortable TUI, exposes a REST API for bot integration, and fires alerts on price impulses and extreme funding rates.
+A real-time terminal screener for cryptocurrency perpetual futures. Tracks every USDT-margined perpetual across Bybit, Binance, and Gate.io (1,700+ symbols combined) via WebSocket, displays live metrics in a sortable TUI, exposes a REST API for bot integration, and fires enriched alerts on price impulses, funding anomalies, and exchange news (delistings/new listings).
 
 ## Why This Exists
 
@@ -14,12 +14,16 @@ The screener is designed as a **market event bus**: it observes the entire futur
 |--------|--------|-------------|
 | Daily Change % | Ticker stream | Price change since daily reset (2 AM configurable) |
 | Trend | 5m candles | UP / DOWN / RANGE from higher-highs/lower-lows pattern |
-| CVD 5m / 1h | Trade stream | Cumulative Volume Delta — net buy vs sell pressure |
+| CVD 5m / 1h / Daily | Trade stream | Cumulative Volume Delta — net buy vs sell pressure |
 | Range 1m | Ticker stream | High - Low within the current minute |
 | Range 5m | 5m kline stream | High - Low of the latest 5-minute candle |
 | NATR 5m/14 | 5m candles | Normalized ATR(14) — volatility as % of price |
 | Volume 24h | Ticker stream | Rolling 24-hour trading volume |
 | Funding Rate | Ticker stream | Current funding rate with countdown to next settlement |
+| Open Interest | Ticker/REST | Current OI in USD + 5m % change |
+| Liquidations | WS stream | Rolling 5m buy/sell liquidation volume |
+| Long/Short Ratio | REST poll | Account long/short ratio (Bybit, Binance) |
+| Delist Date | Announcements API | Upcoming delisting timestamp (if scheduled) |
 | Large Orders | Orderbook depth | Resting limit orders that are large relative to volume |
 
 ## Features
@@ -44,9 +48,11 @@ The screener is designed as a **market event bus**: it observes the entire futur
 
 ### Alerts
 
-- **Price impulses**: detects sudden moves using static threshold (e.g. 3%) and/or NATR-based dynamic threshold
-- **Extreme funding rates**: alerts when funding exceeds configurable threshold
+- **Price impulses**: detects sudden moves using static threshold (e.g. 3%) and/or NATR-based dynamic threshold. Enriched with 21 fields including CVD, funding, trend, OI, liquidations, and L/S ratio
+- **Extreme funding rates**: alerts when funding exceeds configurable threshold, repeats every N seconds while active
+- **News (delistings/new listings)**: polls Bybit announcements API, extracts affected symbols, sets `delist_ts` on tickers
 - **Orderbook walls eaten**: detects when large resting orders disappear (optional, disabled by default)
+- All events include `feed_id` in CCXT unified format (e.g. `BTC/USDT:USDT`) for bot compatibility
 - Dispatched via **HTTP webhooks** and **Telegram** with per-symbol cooldowns
 - All events also published to the **SSE stream** for bot consumption
 
@@ -155,6 +161,18 @@ schedule:
   reset_hour: 2                   # daily metrics reset at 2:00 AM
   timezone: "Europe/Kyiv"
 
+data_streams:
+  oi_enabled: true                # open interest tracking
+  liquidations_enabled: true      # liquidation stream
+  long_short_ratio_enabled: true  # L/S ratio polling
+  oi_poll_interval_s: 60          # Binance OI REST poll interval
+  ls_ratio_poll_interval_s: 300   # L/S ratio REST poll interval
+
+news:
+  enabled: true                   # delisting/listing announcements
+  poll_interval_s: 300            # check every 5 minutes
+  lookback_hours: 72              # alert on announcements from last 72h
+
 orderbook:
   enabled: false                  # large order tracking (bandwidth-intensive)
   min_size_usd: 50000             # minimum USD to qualify as "large"
@@ -187,6 +205,7 @@ Filter by event type:
 ```
 GET /events/stream?event_type=impulse
 GET /events/stream?event_type=funding
+GET /events/stream?event_type=news
 GET /events/stream?event_type=order_eaten
 ```
 
@@ -199,11 +218,22 @@ Configure webhook URLs in `config.yaml`. Each alert is POSTed as JSON:
   "event": "impulse",
   "exchange": "bybit",
   "symbol": "BTCUSDT",
+  "feed_id": "BTC/USDT:USDT",
   "direction": "up",
   "change_pct": 3.45,
   "natr_value": 1.23,
   "price": 65420.5,
   "volume_24h": 52000.0,
+  "cvd_5m": 1234.5,
+  "cvd_1h": -5678.0,
+  "funding_rate": 0.0003,
+  "trend": "UP",
+  "daily_change_pct": 2.1,
+  "open_interest": 15000000.0,
+  "oi_change_5m_pct": 0.5,
+  "liq_buys_5m": 50000.0,
+  "liq_sells_5m": 12000.0,
+  "long_short_ratio": 1.23,
   "timestamp": 1711400000.0
 }
 ```
@@ -215,13 +245,14 @@ Set `SCREENER_TELEGRAM_TOKEN` environment variable or put the token directly in 
 ## Architecture
 
 ```
-Bybit WebSocket (5+ connections: 2 ticker+kline, 3 trade/CVD, 10 orderbook)
+Exchange WebSockets (ticker, kline, trade, liquidation, orderbook)
+REST Pollers (OI, L/S ratio, news/announcements)
     |
     v
 asyncio.Queue --> Engine --> Store (in-memory)
                     |              ^
                     v              | read
-              Alert Queue    TUI / API
+              Alert Queue    TUI / API / News Poller
                     |
                     v
             AlertDispatcher --> Webhooks + Telegram + SSE EventBus
@@ -260,6 +291,7 @@ screener/
   engine.py          # Message processing: NATR, trend, impulse, funding
   orderbook.py       # Orderbook state management, large order detection
   alerts.py          # Webhook + Telegram dispatch with cooldowns
+  news.py            # Bybit announcements poller (delistings, new listings)
   scheduler.py       # Daily reset
   tui.py             # Textual terminal UI
   charts.py          # Multi-timeframe candlestick charts + stats
@@ -268,6 +300,8 @@ screener/
   exchanges/
     __init__.py      # BaseExchange ABC + registry
     bybit.py         # Bybit REST + multi-connection WebSocket
+    binance.py       # Binance REST + combined stream WebSocket
+    gateio.py        # Gate.io REST + WebSocket
 ```
 
 ## Tech Stack

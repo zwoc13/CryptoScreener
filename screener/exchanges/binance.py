@@ -334,35 +334,39 @@ class BinanceExchange(BaseExchange):
             return None
 
     async def _oi_poller(self, symbols: list[str], queue: asyncio.Queue) -> None:
-        """Poll Binance REST API for open interest."""
+        """Poll Binance REST API for open interest using concurrent batches."""
         ds = self._settings.data_streams if self._settings else None
         interval = ds.oi_poll_interval_s if ds else 60
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_one(client: httpx.AsyncClient, sym: str) -> None:
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        "/fapi/v1/openInterest",
+                        params={"symbol": sym},
+                    )
+                    if resp.status_code != 200:
+                        return
+                    data = resp.json()
+                    oi = float(data.get("openInterest", 0))
+                    await queue.put(OpenInterestMessage(
+                        exchange="binance",
+                        symbol=sym,
+                        open_interest=oi,
+                        open_interest_value=0,
+                        timestamp=time(),
+                    ))
+                except Exception:
+                    pass
+
         async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
             while self._running:
                 try:
-                    for sym in symbols:
-                        if not self._running:
-                            break
-                        try:
-                            resp = await client.get(
-                                "/fapi/v1/openInterest",
-                                params={"symbol": sym},
-                            )
-                            if resp.status_code != 200:
-                                continue
-                            data = resp.json()
-                            oi = float(data.get("openInterest", 0))
-                            # We don't have USD value directly, use 0 (engine will use oi)
-                            await queue.put(OpenInterestMessage(
-                                exchange="binance",
-                                symbol=sym,
-                                open_interest=oi,
-                                open_interest_value=0,
-                                timestamp=time(),
-                            ))
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.05)  # rate limit: ~20 req/s
+                    await asyncio.gather(
+                        *(fetch_one(client, sym) for sym in symbols),
+                        return_exceptions=True,
+                    )
                 except asyncio.CancelledError:
                     return
                 except Exception:
@@ -372,34 +376,39 @@ class BinanceExchange(BaseExchange):
     async def _long_short_ratio_poller(
         self, symbols: list[str], queue: asyncio.Queue
     ) -> None:
-        """Poll Binance REST API for long/short ratio."""
+        """Poll Binance REST API for long/short ratio using concurrent batches."""
         ds = self._settings.data_streams if self._settings else None
         interval = ds.ls_ratio_poll_interval_s if ds else 300
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_one(client: httpx.AsyncClient, sym: str) -> None:
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        "/futures/data/globalLongShortAccountRatio",
+                        params={"symbol": sym, "period": "5m", "limit": 1},
+                    )
+                    if resp.status_code != 200:
+                        return
+                    data = resp.json()
+                    if data:
+                        ratio = float(data[0].get("longShortRatio", 0))
+                        await queue.put(LongShortRatioMessage(
+                            exchange="binance",
+                            symbol=sym,
+                            long_short_ratio=round(ratio, 4),
+                            timestamp=time(),
+                        ))
+                except Exception:
+                    pass
+
         async with httpx.AsyncClient(base_url=self._config.rest_url, timeout=15) as client:
             while self._running:
                 try:
-                    for sym in symbols:
-                        if not self._running:
-                            break
-                        try:
-                            resp = await client.get(
-                                "/futures/data/globalLongShortAccountRatio",
-                                params={"symbol": sym, "period": "5m", "limit": 1},
-                            )
-                            if resp.status_code != 200:
-                                continue
-                            data = resp.json()
-                            if data:
-                                ratio = float(data[0].get("longShortRatio", 0))
-                                await queue.put(LongShortRatioMessage(
-                                    exchange="binance",
-                                    symbol=sym,
-                                    long_short_ratio=round(ratio, 4),
-                                    timestamp=time(),
-                                ))
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.1)
+                    await asyncio.gather(
+                        *(fetch_one(client, sym) for sym in symbols),
+                        return_exceptions=True,
+                    )
                 except asyncio.CancelledError:
                     return
                 except Exception:

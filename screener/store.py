@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from time import time
 
-from .models import CandleBar, TickerState
+from .models import CandleBar, TickerState, to_feed_id
 
 
 def _key(exchange: str, symbol: str) -> str:
@@ -47,7 +47,7 @@ class Store:
     def get_or_create_ticker(self, exchange: str, symbol: str) -> TickerState:
         k = _key(exchange, symbol)
         if k not in self._tickers:
-            self._tickers[k] = TickerState(exchange=exchange, symbol=symbol)
+            self._tickers[k] = TickerState(exchange=exchange, symbol=symbol, feed_id=to_feed_id(symbol))
             self._symbol_count = len(self._tickers)
         return self._tickers[k]
 
@@ -67,7 +67,7 @@ class Store:
     def get_candles(self, exchange: str, symbol: str) -> deque[CandleBar]:
         k = _key(exchange, symbol)
         if k not in self._candles:
-            self._candles[k] = deque(maxlen=self._natr_period + 1)
+            self._candles[k] = deque(maxlen=max(self._natr_period + 1, 50))
         return self._candles[k]
 
     def add_candle(self, exchange: str, symbol: str, candle: CandleBar) -> None:
@@ -79,7 +79,18 @@ class Store:
 
     def load_candles(self, exchange: str, symbol: str, candles: list[CandleBar]) -> None:
         k = _key(exchange, symbol)
-        self._candles[k] = deque(candles, maxlen=self._natr_period + 1)
+        self._candles[k] = deque(candles, maxlen=max(self._natr_period + 1, 50))
+
+    def get_range(self, exchange: str, symbol: str, n_candles: int) -> float:
+        """High-low range over the last n confirmed 5m candles."""
+        k = _key(exchange, symbol)
+        candles = self._candles.get(k)
+        if not candles:
+            return 0.0
+        confirmed = [c for c in candles if c.confirmed][-n_candles:]
+        if not confirmed:
+            return 0.0
+        return max(c.high for c in confirmed) - min(c.low for c in confirmed)
 
     # -- CVD (Cumulative Volume Delta) --
 
