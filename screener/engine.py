@@ -37,6 +37,8 @@ class Engine:
         self._price_history: dict[str, deque[tuple[float, float]]] = {}
         # Per-symbol impulse cooldown: key -> timestamp of last impulse alert
         self._impulse_cooldown: dict[str, float] = {}
+        # Pending impulses awaiting confirmation: key -> (detected_at, ref_price, direction)
+        self._pending_impulses: dict[str, tuple[float, float, str]] = {}
         # Track last funding alert timestamp per symbol
         self._last_funding_alert_ts: dict[str, float] = {}
 
@@ -231,6 +233,42 @@ class Engine:
             return "DOWN"
         return "RANGE"
 
+    def _fire_impulse(
+        self, ticker: TickerState, new_price: float, change_pct: float, direction: str, now: float
+    ) -> None:
+        self._impulse_cooldown[key := f"{ticker.exchange}:{ticker.symbol}"] = now
+        liq_buys, liq_sells = self._store.get_liq_rolling(ticker.exchange, ticker.symbol, 300)
+        event = ImpulseEvent(
+            exchange=ticker.exchange,
+            symbol=ticker.symbol,
+            feed_id=ticker.feed_id,
+            direction=direction,
+            change_pct=round(change_pct, 2),
+            natr_value=round(ticker.natr_5m_14, 4),
+            price=new_price,
+            volume_24h=ticker.volume_24h,
+            cvd_5m=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 300), 2),
+            cvd_1h=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 3600), 2),
+            cvd_daily=round(self._store.get_cvd_daily(ticker.exchange, ticker.symbol), 2),
+            funding_rate=ticker.funding_rate,
+            trend=ticker.trend,
+            daily_change_pct=round(ticker.daily_change_pct, 2),
+            range_1m=ticker.range_1m,
+            range_5m=ticker.range_5m,
+            range_1h=ticker.range_1h,
+            range_4h=ticker.range_4h,
+            open_interest=ticker.open_interest,
+            oi_change_5m_pct=round(ticker.oi_change_5m_pct, 2),
+            liq_buys_5m=round(liq_buys, 2),
+            liq_sells_5m=round(liq_sells, 2),
+            long_short_ratio=ticker.long_short_ratio,
+        )
+        self._alert_queue.put_nowait(event)
+        logger.info(
+            "Impulse: %s %s %s %.2f%% (NATR: %.4f)",
+            ticker.exchange, ticker.symbol, direction, change_pct, ticker.natr_5m_14,
+        )
+
     def _check_impulse(
         self, ticker: TickerState, old_price: float, new_price: float, now: float
     ) -> None:
@@ -239,6 +277,31 @@ class Engine:
         # Engine-level cooldown: don't check again for N seconds after firing
         last_impulse = self._impulse_cooldown.get(key, 0)
         if now - last_impulse < self._settings.impulse.cooldown_seconds:
+            self._pending_impulses.pop(key, None)
+            return
+
+        confirmation_seconds = self._settings.impulse.confirmation_seconds
+
+        # If there is a pending impulse awaiting confirmation, check it first
+        if key in self._pending_impulses:
+            detected_at, ref_price, pending_direction = self._pending_impulses[key]
+            elapsed = now - detected_at
+            # Recalculate move relative to the original reference price
+            current_change = (new_price - ref_price) / ref_price * 100
+            current_direction = "up" if current_change > 0 else "down"
+            if current_direction != pending_direction:
+                # Move reversed — discard without firing
+                logger.debug("Impulse reversed before confirmation: %s", key)
+                del self._pending_impulses[key]
+            elif elapsed >= confirmation_seconds:
+                # Move held through the confirmation window — fire
+                del self._pending_impulses[key]
+                history = self._price_history.get(key)
+                if history is not None:
+                    history.clear()
+                    history.append((now, new_price))
+                self._fire_impulse(ticker, new_price, abs(current_change), current_direction, now)
+            # else: still within confirmation window, keep waiting
             return
 
         history = self._price_history.setdefault(key, deque(maxlen=120))
@@ -274,44 +337,18 @@ class Engine:
             triggered = static_triggered and natr_triggered
 
         if triggered:
-            self._impulse_cooldown[key] = now
-            # Reset price history so the window starts fresh after the impulse
-            history.clear()
-            history.append((now, new_price))
-
-            liq_buys, liq_sells = self._store.get_liq_rolling(
-                ticker.exchange, ticker.symbol, 300
-            )
-            event = ImpulseEvent(
-                exchange=ticker.exchange,
-                symbol=ticker.symbol,
-                feed_id=ticker.feed_id,
-                direction=direction,
-                change_pct=round(change_pct, 2),
-                natr_value=round(ticker.natr_5m_14, 4),
-                price=new_price,
-                volume_24h=ticker.volume_24h,
-                cvd_5m=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 300), 2),
-                cvd_1h=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 3600), 2),
-                cvd_daily=round(self._store.get_cvd_daily(ticker.exchange, ticker.symbol), 2),
-                funding_rate=ticker.funding_rate,
-                trend=ticker.trend,
-                daily_change_pct=round(ticker.daily_change_pct, 2),
-                range_1m=ticker.range_1m,
-                range_5m=ticker.range_5m,
-                range_1h=ticker.range_1h,
-                range_4h=ticker.range_4h,
-                open_interest=ticker.open_interest,
-                oi_change_5m_pct=round(ticker.oi_change_5m_pct, 2),
-                liq_buys_5m=round(liq_buys, 2),
-                liq_sells_5m=round(liq_sells, 2),
-                long_short_ratio=ticker.long_short_ratio,
-            )
-            self._alert_queue.put_nowait(event)
-            logger.info(
-                "Impulse: %s %s %s %.2f%% (NATR: %.4f)",
-                ticker.exchange, ticker.symbol, direction, change_pct, ticker.natr_5m_14,
-            )
+            if confirmation_seconds > 0:
+                # Park as pending — fire only after move holds for confirmation_seconds
+                self._pending_impulses[key] = (now, oldest_price, direction)
+                logger.debug(
+                    "Impulse pending confirmation: %s %s %.2f%% (wait %ds)",
+                    key, direction, change_pct, confirmation_seconds,
+                )
+            else:
+                # Fire immediately (original behaviour)
+                history.clear()
+                history.append((now, new_price))
+                self._fire_impulse(ticker, new_price, change_pct, direction, now)
 
     def _check_funding(self, ticker: TickerState) -> None:
         threshold = self._settings.funding.alert_threshold

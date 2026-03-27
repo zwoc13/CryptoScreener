@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from time import time
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -176,7 +176,7 @@ class NewsPanel(Static):
     DEFAULT_CSS = """
     NewsPanel {
         height: auto;
-        max-height: 10;
+        max-height: 14;
         overflow-y: auto;
         padding: 0 1;
         border-top: solid $surface-lighten-2;
@@ -189,40 +189,62 @@ class NewsPanel(Static):
         self._tz = ZoneInfo(timezone)
         self._last_count = 0
 
+    @staticmethod
+    def _fmt_recv(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M UTC")
+
+    @staticmethod
+    def _fmt_event_ts(ts: float) -> str:
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    def _render_news_group(self, events: list[NewsEvent], lines: list[str], header: str) -> None:
+        if not events:
+            return
+        lines.append(f"[dim]── {header} ──[/dim]")
+        for event in events:
+            recv_str = self._fmt_recv(event.timestamp)
+            event_date_str = self._fmt_event_ts(event.event_ts)
+
+            symbols_str = ", ".join(event.symbols[:5]) if event.symbols else "[dim]no symbols[/dim]"
+            if len(event.symbols) > 5:
+                symbols_str += f" +{len(event.symbols) - 5}"
+
+            date_part = f"  [dim]→ {event_date_str}[/dim]" if event_date_str else ""
+            lines.append(f"[dim]{recv_str}[/dim]  [bold]{symbols_str}[/bold]{date_part}")
+            if event.title:
+                lines.append(f"          [dim]{event.title[:70]}[/dim]")
+            lines.append("")
+
     def refresh_news(self) -> None:
         count = len(self._alerts)
         if count == self._last_count:
             return
         self._last_count = count
 
-        lines: list[str] = ["[bold underline]News[/bold underline]\n"]
-        news_count = 0
+        listings: list[NewsEvent] = []
+        delistings: list[NewsEvent] = []
+        other: list[NewsEvent] = []
 
         for event in self._alerts:
             if not isinstance(event, NewsEvent):
                 continue
-            news_count += 1
-            ts = datetime.fromtimestamp(event.timestamp, tz=self._tz)
-            time_str = ts.strftime("%H:%M:%S")
-
-            if event.news_type == "delisting":
-                icon = "[bold red]DELIST[/]"
-            elif event.news_type == "new_listing":
-                icon = "[bold green]LISTING[/]"
+            if event.news_type == "new_listing":
+                listings.append(event)
+            elif event.news_type == "delisting":
+                delistings.append(event)
             else:
-                icon = f"[yellow]{event.news_type.upper()}[/]"
+                other.append(event)
 
-            symbols_str = ", ".join(event.symbols[:5]) if event.symbols else ""
-            if len(event.symbols) > 5:
-                symbols_str += f" +{len(event.symbols) - 5}"
+        lines: list[str] = ["[bold underline]News[/bold underline]\n"]
 
-            lines.append(f"[dim]{time_str}[/dim] {icon}  [bold]{symbols_str}[/bold]")
-            if event.title:
-                lines.append(f"         [dim]{event.title[:60]}[/dim]")
-            lines.append("")
-
-        if news_count == 0:
+        if not listings and not delistings and not other:
             lines.append("[dim]No news yet...[/dim]")
+        else:
+            self._render_news_group(listings, lines, "[bold green]LISTINGS[/bold green]")
+            self._render_news_group(delistings, lines, "[bold red]DELISTINGS[/bold red]")
+            self._render_news_group(other, lines, "OTHER")
 
         self.update("\n".join(lines))
 

@@ -19,6 +19,7 @@ class ImpulseConfig(BaseModel):
     natr_multiplier: float = 2.5
     combine_mode: str = "or"  # "or" | "and"
     cooldown_seconds: int = 30
+    confirmation_seconds: int = 0  # wait N seconds after detection before firing; 0 = fire immediately
 
 
 class NatrConfig(BaseModel):
