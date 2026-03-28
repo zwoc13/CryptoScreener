@@ -86,6 +86,12 @@ class Engine:
             self._store.update_open_interest(msg.exchange, msg.symbol, oi_usd, now)
             ticker.open_interest = oi_usd
             ticker.oi_change_5m_pct = self._store.get_oi_change_5m_pct(msg.exchange, msg.symbol)
+        elif msg.open_interest is not None and ticker.last_price > 0:
+            # Exchange sent OI in contracts only — convert to USD using current price
+            oi_usd = msg.open_interest * ticker.last_price
+            self._store.update_open_interest(msg.exchange, msg.symbol, oi_usd, now)
+            ticker.open_interest = oi_usd
+            ticker.oi_change_5m_pct = self._store.get_oi_change_5m_pct(msg.exchange, msg.symbol)
         ticker.last_update_ts = now
 
         price = ticker.last_price
@@ -144,7 +150,13 @@ class Engine:
     def _handle_open_interest(self, msg: OpenInterestMessage) -> None:
         self._store.touch()
         ticker = self._store.get_or_create_ticker(msg.exchange, msg.symbol)
-        oi_usd = msg.open_interest_value if msg.open_interest_value > 0 else msg.open_interest
+        if msg.open_interest_value > 0:
+            oi_usd = msg.open_interest_value
+        elif msg.open_interest > 0 and ticker.last_price > 0:
+            # Exchange returned OI in contracts — convert to USD using current price
+            oi_usd = msg.open_interest * ticker.last_price
+        else:
+            return
         self._store.update_open_interest(msg.exchange, msg.symbol, oi_usd, msg.timestamp)
         ticker.open_interest = oi_usd
         ticker.oi_change_5m_pct = self._store.get_oi_change_5m_pct(msg.exchange, msg.symbol)
