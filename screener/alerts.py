@@ -25,11 +25,16 @@ class AlertDispatcher:
 
     async def run(self, alert_queue: asyncio.Queue) -> None:
         logger.info("Alert dispatcher started")
+        self._bg_tasks: set[asyncio.Task] = set()
         async with httpx.AsyncClient(timeout=10) as client:
             while True:
                 event = await alert_queue.get()
                 try:
-                    await self._dispatch(event, client)
+                    dispatched = self._prepare_dispatch(event)
+                    if dispatched is not None:
+                        task = asyncio.create_task(self._send_all(client, *dispatched))
+                        self._bg_tasks.add(task)
+                        task.add_done_callback(self._bg_tasks.discard)
                     self._expire_old()
                 except Exception:
                     logger.exception("Alert dispatch error")
@@ -43,7 +48,8 @@ class AlertDispatcher:
         while self.recent and self.recent[-1].timestamp < cutoff:
             self.recent.pop()
 
-    async def _dispatch(self, event: AlertEvent, client: httpx.AsyncClient) -> None:
+    def _prepare_dispatch(self, event: AlertEvent) -> tuple[AlertEvent, str] | None:
+        """Check cooldowns and record the event. Returns (event, alert_type) or None if suppressed."""
         if isinstance(event, ImpulseEvent):
             alert_type = "impulse"
         elif isinstance(event, FundingAlert):
@@ -55,7 +61,7 @@ class AlertDispatcher:
         elif isinstance(event, NewsEvent):
             alert_type = "news"
         else:
-            return
+            return None
 
         # Check cooldown (news uses URL as unique key)
         if isinstance(event, NewsEvent):
@@ -69,7 +75,7 @@ class AlertDispatcher:
             cooldown = self._settings.alerts.cooldown_seconds
         last = self._cooldowns.get(key, 0)
         if now - last < cooldown:
-            return
+            return None
 
         self._cooldowns[key] = now
         self.recent.appendleft(event)
@@ -78,7 +84,12 @@ class AlertDispatcher:
         if self._event_bus is not None:
             self._event_bus.publish(event)
 
-        # Dispatch in parallel
+        return event, alert_type
+
+    async def _send_all(
+        self, client: httpx.AsyncClient, event: AlertEvent, alert_type: str
+    ) -> None:
+        """Send webhooks and Telegram notifications in parallel (runs as background task)."""
         tasks: list[asyncio.Task] = []
         for webhook in self._settings.alerts.webhooks:
             tasks.append(

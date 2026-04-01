@@ -44,12 +44,18 @@ async def warmup_klines(
     logger.info("Kline warmup complete")
 
 
+_SNAPSHOT_PATH = "snapshot.json"
+
+
 async def run(mode: str) -> None:
     settings = load_settings()
     store = Store(natr_period=settings.natr.period)
     msg_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
     alert_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
     start_time = time()
+
+    # Restore previous state if available
+    restored = store.snapshot_restore(_SNAPSHOT_PATH)
 
     # Initialize exchanges
     exchanges = []
@@ -72,6 +78,7 @@ async def run(mode: str) -> None:
         logger.info("%s: %d symbols", ex.name, len(symbols))
 
     # Warmup klines for NATR + 4h range (need 48 candles for 4h range)
+    # If we restored a snapshot, kline warmup still runs to get the freshest candles
     warmup_limit = max(settings.natr.period + 1, 50)
     for ex in exchanges:
         syms = all_symbols.get(ex.name, [])
@@ -119,16 +126,20 @@ async def run(mode: str) -> None:
     # Scheduler
     tasks.append(asyncio.create_task(run_daily_reset(store, settings), name="scheduler"))
 
-    # News poller (delistings, new listings)
+    exchange_map = {ex.name: ex for ex in exchanges}
+
+    # News poller (delistings, new listings, dynamic subscribe/unsubscribe)
     if settings.news.enabled:
         from .news import run_news_poller
         tasks.append(asyncio.create_task(
-            run_news_poller(alert_queue, settings, store),
+            run_news_poller(
+                alert_queue, settings, store,
+                exchanges=exchange_map, msg_queue=msg_queue,
+            ),
             name="news-poller",
         ))
 
     # API server
-    exchange_map = {ex.name: ex for ex in exchanges}
 
     if mode in ("api", "both", "server"):
         app = create_api(store, dispatcher.recent, start_time, event_bus=event_bus, exchanges=exchange_map)
@@ -156,7 +167,8 @@ async def run(mode: str) -> None:
     shutdown_event = asyncio.Event()
 
     def _signal_handler():
-        logger.info("Shutdown signal received")
+        logger.info("Shutdown signal received, saving snapshot...")
+        store.snapshot_save(_SNAPSHOT_PATH)
         shutdown_event.set()
         for ex in exchanges:
             asyncio.create_task(ex.stop())

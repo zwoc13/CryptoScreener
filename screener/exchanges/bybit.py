@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from time import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import websockets
@@ -43,6 +43,11 @@ class BybitExchange(BaseExchange):
         self._ws_tasks: list[asyncio.Task] = []
         self._running = False
         self._ob_manager: OrderbookManager | None = None
+        # Dynamic subscribe support: live WS refs, topic lists, and conn types
+        self._live_ws: dict[int, Any] = {}  # conn_id -> WS object
+        self._conn_topics: dict[int, list[str]] = {}  # conn_id -> mutable topic list
+        self._conn_type: dict[int, str] = {}  # conn_id -> "ticker_kline"|"trade"|"liq"|"orderbook"
+        self._ls_ratio_symbols: list[str] = []  # mutable list for LS poller
 
     # -- REST --
 
@@ -63,9 +68,10 @@ class BybitExchange(BaseExchange):
                 data = resp.json()
                 result = data.get("result", {})
                 for item in result.get("list", []):
-                    # Only USDT perpetuals
-                    if item.get("settleCoin") == "USDT":
-                        symbols.append(item["symbol"])
+                    # Only USDT perpetuals (skip dated/expiration futures like DOGEUSDT-03APR26)
+                    sym = item["symbol"]
+                    if item.get("settleCoin") == "USDT" and "-" not in sym:
+                        symbols.append(sym)
                 cursor = result.get("nextPageCursor", "")
                 if not cursor:
                     break
@@ -129,6 +135,8 @@ class BybitExchange(BaseExchange):
 
         conn_id = 0
         for topics in ticker_kline_topics:
+            self._conn_topics[conn_id] = topics
+            self._conn_type[conn_id] = "ticker_kline"
             task = asyncio.create_task(
                 self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-{conn_id}"
             )
@@ -143,6 +151,8 @@ class BybitExchange(BaseExchange):
                 trade_topics[i % n_trade_conns].append(f"publicTrade.{sym}")
 
             for topics in trade_topics:
+                self._conn_topics[conn_id] = topics
+                self._conn_type[conn_id] = "trade"
                 task = asyncio.create_task(
                     self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-trade-{conn_id}"
                 )
@@ -157,6 +167,8 @@ class BybitExchange(BaseExchange):
                 liq_topics[i % n_liq_conns].append(f"liquidation.{sym}")
 
             for topics in liq_topics:
+                self._conn_topics[conn_id] = topics
+                self._conn_type[conn_id] = "liq"
                 task = asyncio.create_task(
                     self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-liq-{conn_id}"
                 )
@@ -174,6 +186,8 @@ class BybitExchange(BaseExchange):
                 ob_topics[i % n_ob_conns].append(f"orderbook.{depth}.{sym}")
 
             for topics in ob_topics:
+                self._conn_topics[conn_id] = topics
+                self._conn_type[conn_id] = "orderbook"
                 task = asyncio.create_task(
                     self._ws_loop(conn_id, topics, queue), name=f"bybit-ws-ob-{conn_id}"
                 )
@@ -181,9 +195,10 @@ class BybitExchange(BaseExchange):
                 conn_id += 1
 
         # Long/Short ratio REST poller
+        self._ls_ratio_symbols = list(symbols)
         if ds and ds.long_short_ratio_enabled:
             task = asyncio.create_task(
-                self._long_short_ratio_poller(symbols, queue),
+                self._long_short_ratio_poller(self._ls_ratio_symbols, queue),
                 name="bybit-ls-ratio-poller",
             )
             self._ws_tasks.append(task)
@@ -221,6 +236,7 @@ class BybitExchange(BaseExchange):
     ) -> None:
         url = self._config.ws_url
         async with websockets.connect(url, ping_interval=None) as ws:
+            self._live_ws[conn_id] = ws
             logger.info("Bybit WS-%d connected to %s", conn_id, url)
 
             # Subscribe in batches
@@ -272,6 +288,7 @@ class BybitExchange(BaseExchange):
                         if self._ob_manager is not None:
                             self._handle_orderbook(topic, msg_data, data.get("type"))
             finally:
+                self._live_ws.pop(conn_id, None)
                 ping_task.cancel()
 
     async def _ping_loop(self, ws, conn_id: int) -> None:
@@ -426,6 +443,72 @@ class BybitExchange(BaseExchange):
                 except Exception:
                     logger.exception("Bybit L/S ratio poller error")
                 await asyncio.sleep(interval)
+
+    async def subscribe_symbol(self, symbol: str, queue: asyncio.Queue) -> None:
+        """Dynamically subscribe to a new symbol on all live WS connections."""
+        topic_map = {
+            "ticker_kline": [f"tickers.{symbol}", f"kline.5.{symbol}"],
+            "trade": [f"publicTrade.{symbol}"],
+            "liq": [f"liquidation.{symbol}"],
+        }
+        # Determine orderbook depth from config if available
+        if self._ob_manager is not None:
+            depth = self._ob_manager._cfg.depth
+            topic_map["orderbook"] = [f"orderbook.{depth}.{symbol}"]
+
+        for conn_id, ws in list(self._live_ws.items()):
+            ctype = self._conn_type.get(conn_id)
+            new_topics = topic_map.get(ctype)
+            if not new_topics:
+                continue
+            # Pick only one connection per type (the first live one)
+            try:
+                await ws.send(json.dumps({"op": "subscribe", "args": new_topics}))
+                # Add to topic list so reconnects re-subscribe
+                topics = self._conn_topics.get(conn_id)
+                if topics is not None:
+                    topics.extend(new_topics)
+                logger.info("Bybit: dynamically subscribed %s on WS-%d (%s)", symbol, conn_id, ctype)
+            except Exception:
+                logger.warning("Bybit: failed to subscribe %s on WS-%d", symbol, conn_id)
+                continue
+            # Remove from topic_map so we only subscribe on one conn per type
+            del topic_map[ctype]
+            if not topic_map:
+                break
+
+        # Add to LS ratio poller
+        if symbol not in self._ls_ratio_symbols:
+            self._ls_ratio_symbols.append(symbol)
+
+    async def unsubscribe_symbol(self, symbol: str) -> None:
+        """Dynamically unsubscribe a symbol from all live WS connections."""
+        unsub_patterns = [
+            f"tickers.{symbol}", f"kline.5.{symbol}",
+            f"publicTrade.{symbol}", f"liquidation.{symbol}",
+        ]
+        if self._ob_manager is not None:
+            depth = self._ob_manager._cfg.depth
+            unsub_patterns.append(f"orderbook.{depth}.{symbol}")
+
+        for conn_id, ws in list(self._live_ws.items()):
+            topics = self._conn_topics.get(conn_id, [])
+            matching = [t for t in topics if t in unsub_patterns]
+            if not matching:
+                continue
+            try:
+                await ws.send(json.dumps({"op": "unsubscribe", "args": matching}))
+                for t in matching:
+                    topics.remove(t)
+                logger.info("Bybit: unsubscribed %s from WS-%d", symbol, conn_id)
+            except Exception:
+                logger.warning("Bybit: failed to unsubscribe %s from WS-%d", symbol, conn_id)
+
+        # Remove from LS ratio poller
+        try:
+            self._ls_ratio_symbols.remove(symbol)
+        except ValueError:
+            pass
 
     async def stop(self) -> None:
         self._running = False

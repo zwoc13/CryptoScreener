@@ -38,6 +38,12 @@ class BaseExchange(ABC):
         """Connect WS and push TickerMessage/KlineMessage to queue. Blocks until stopped."""
         ...
 
+    async def subscribe_symbol(self, symbol: str, queue: asyncio.Queue) -> None:
+        """Dynamically subscribe to a new symbol on live WS connections."""
+
+    async def unsubscribe_symbol(self, symbol: str) -> None:
+        """Dynamically unsubscribe a symbol from live WS connections."""
+
     @abstractmethod
     async def stop(self) -> None:
         """Gracefully close all connections."""

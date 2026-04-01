@@ -149,6 +149,12 @@ def create_api(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.post("/snapshot")
+    def save_snapshot():
+        """Save full store state to disk for restore after restart."""
+        path = store.snapshot_save()
+        return {"status": "ok", "path": path}
+
     @app.get("/health")
     def health():
         last = store.last_message_ts
