@@ -58,3 +58,8 @@ orderbook:
   alert_on_new: false          # alert when large order first spotted
   alert_on_eaten: false        # alert when large order disappears
   ws_connections: 10
+
+questdb:
+  enabled: false
+  host: "localhost"              # use "questdb" when running in Docker
+  port: 9009

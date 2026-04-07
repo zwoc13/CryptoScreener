@@ -13,6 +13,7 @@ dependencies = [
     "textual-plotext>=1.0.1",
     "uvicorn[standard]>=0.42.0",
     "websockets>=16.0",
+    "questdb>=2.0.0",
 ]
 
 [project.scripts]

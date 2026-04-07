@@ -84,10 +84,17 @@ async def run(mode: str) -> None:
         syms = all_symbols.get(ex.name, [])
         await warmup_klines(ex, syms, settings.natr.interval, warmup_limit, store)
 
+    # Initialize recorder (QuestDB time-series persistence)
+    recorder = None
+    if settings.questdb.enabled:
+        from .recorder import QuestDBRecorder
+        recorder = QuestDBRecorder(settings.questdb)
+        recorder.start()
+
     # Initialize engine, alert dispatcher, and orderbook manager
     from .api import EventBus
     event_bus = EventBus()
-    engine = Engine(store, alert_queue, settings)
+    engine = Engine(store, alert_queue, settings, recorder=recorder)
     dispatcher = AlertDispatcher(settings, event_bus=event_bus)
 
     ob_manager = None
@@ -168,6 +175,8 @@ async def run(mode: str) -> None:
 
     def _signal_handler():
         logger.info("Shutdown signal received, saving snapshot...")
+        if recorder is not None:
+            recorder.stop()
         store.snapshot_save(_SNAPSHOT_PATH)
         shutdown_event.set()
         for ex in exchanges:

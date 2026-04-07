@@ -1,4 +1,20 @@
 services:
+  questdb:
+    image: questdb/questdb:8.2.2
+    container_name: questdb
+    ports:
+      - "9009:9009"   # ILP TCP ingestion
+      - "9000:9000"   # Web Console + REST API
+      - "8812:8812"   # PostgreSQL wire protocol
+    volumes:
+      - questdb-data:/var/lib/questdb
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/status || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   screener:
     container_name: screener
     build: .
@@ -8,7 +24,15 @@ services:
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - SCREENER_TELEGRAM_TOKEN=${SCREENER_TELEGRAM_TOKEN:-}
+      - QUESTDB_ENABLED=true
+      - QUESTDB_HOST=questdb
+    depends_on:
+      questdb:
+        condition: service_healthy
     restart: unless-stopped
     stdin_open: true  # docker run -i
     tty: true         # docker run -t
     command: ["uv", "run", "python", "-m", "screener", "--mode", "both"]
+
+volumes:
+  questdb-data:

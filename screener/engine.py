@@ -29,10 +29,12 @@ class Engine:
         store: Store,
         alert_queue: asyncio.Queue,
         settings: Settings,
+        recorder: object | None = None,
     ) -> None:
         self._store = store
         self._alert_queue = alert_queue
         self._settings = settings
+        self._recorder = recorder
         # Per-symbol sliding window of recent prices for impulse detection
         self._price_history: dict[str, deque[tuple[float, float]]] = {}
         # Per-symbol impulse cooldown: key -> timestamp of last impulse alert
@@ -46,6 +48,8 @@ class Engine:
         logger.info("Engine started")
         while True:
             msg = await msg_queue.get()
+            if self._recorder is not None:
+                self._recorder.on_message(msg)
             try:
                 if isinstance(msg, TickerMessage):
                     self._handle_ticker(msg)

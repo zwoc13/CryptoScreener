@@ -94,6 +94,15 @@ class ApiConfig(BaseModel):
     host: str = "0.0.0.0"
 
 
+class QuestDBConfig(BaseModel):
+    enabled: bool = False
+    host: str = "localhost"
+    port: int = 9009
+    auto_flush_rows: int = 10_000
+    auto_flush_interval_ms: int = 1_000
+    ticker_throttle_ms: int = 1000  # min ms between ticker records per symbol
+
+
 class Settings(BaseModel):
     exchanges: dict[str, ExchangeConfig] = Field(default_factory=dict)
     impulse: ImpulseConfig = Field(default_factory=ImpulseConfig)
@@ -107,6 +116,7 @@ class Settings(BaseModel):
     data_streams: DataStreamsConfig = Field(default_factory=DataStreamsConfig)
     news: NewsConfig = Field(default_factory=NewsConfig)
     filters: FilterConfig = Field(default_factory=FilterConfig)
+    questdb: QuestDBConfig = Field(default_factory=QuestDBConfig)
 
 
 def load_settings(path: str | Path = "config.yaml") -> Settings:
@@ -121,5 +131,13 @@ def load_settings(path: str | Path = "config.yaml") -> Settings:
     tg_token = os.environ.get("SCREENER_TELEGRAM_TOKEN")
     if tg_token:
         raw.setdefault("alerts", {}).setdefault("telegram", {})["bot_token"] = tg_token
+
+    # Env var overrides for QuestDB
+    qdb_host = os.environ.get("QUESTDB_HOST")
+    if qdb_host:
+        raw.setdefault("questdb", {})["host"] = qdb_host
+    qdb_enabled = os.environ.get("QUESTDB_ENABLED")
+    if qdb_enabled is not None:
+        raw.setdefault("questdb", {})["enabled"] = qdb_enabled.lower() in ("1", "true", "yes")
 
     return Settings(**raw)
