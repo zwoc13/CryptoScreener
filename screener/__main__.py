@@ -77,6 +77,22 @@ async def run(mode: str) -> None:
         all_symbols[ex.name] = symbols
         logger.info("%s: %d symbols", ex.name, len(symbols))
 
+    # Prune restored tickers that are no longer tradeable on their exchange
+    # (delisted pairs, expired dated futures, etc. that linger in snapshot.json)
+    if restored:
+        active_per_exchange = {name: set(syms) for name, syms in all_symbols.items()}
+        stale = [
+            (t.exchange, t.symbol)
+            for t in store.get_all_sorted()
+            if t.symbol not in active_per_exchange.get(t.exchange, set())
+        ]
+        for exch, sym in stale:
+            store.remove_ticker(exch, sym)
+        if stale:
+            logger.info("Pruned %d stale tickers from snapshot: %s",
+                        len(stale), ", ".join(f"{e}:{s}" for e, s in stale[:10])
+                        + (" ..." if len(stale) > 10 else ""))
+
     # Warmup klines for NATR + 4h range (need 48 candles for 4h range)
     # If we restored a snapshot, kline warmup still runs to get the freshest candles
     warmup_limit = max(settings.natr.period + 1, 50)
