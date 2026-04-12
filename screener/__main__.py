@@ -47,9 +47,32 @@ async def warmup_klines(
 _SNAPSHOT_PATH = "snapshot.json"
 
 
+async def _mem_profile_loop(interval_s: int = 300) -> None:
+    """Periodically log top memory allocators. Enabled by --mem-profile."""
+    import tracemalloc
+    log = logging.getLogger("memprof")
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            snap = tracemalloc.take_snapshot()
+            total_mb = sum(s.size for s in snap.statistics("filename")) / 1024 / 1024
+            log.info("=== Tracemalloc total: %.1f MB ===", total_mb)
+            for stat in snap.statistics("lineno")[:15]:
+                log.info("  %s", stat)
+        except Exception:
+            log.exception("memprof iteration failed")
+
+
 async def run(mode: str) -> None:
     settings = load_settings()
-    store = Store(natr_period=settings.natr.period)
+
+    # Optionally attach a QuestDB reader for long-window queries (>4h)
+    questdb_reader = None
+    if settings.questdb.enabled:
+        from .questdb_reader import QuestDBReader
+        questdb_reader = QuestDBReader(settings.questdb)
+
+    store = Store(natr_period=settings.natr.period, questdb_reader=questdb_reader)
     msg_queue: asyncio.Queue = asyncio.Queue(maxsize=50_000)
     alert_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
     start_time = time()
@@ -113,6 +136,11 @@ async def run(mode: str) -> None:
     engine = Engine(store, alert_queue, settings, recorder=recorder)
     dispatcher = AlertDispatcher(settings, event_bus=event_bus)
 
+    # Signal history layer + evaluator (Phase C: continuous event generation)
+    from .signal_history import SignalHistory
+    from .evaluator import run_signal_evaluator
+    signal_history = SignalHistory()
+
     ob_manager = None
     if settings.orderbook.enabled:
         from .orderbook import OrderbookManager
@@ -149,6 +177,12 @@ async def run(mode: str) -> None:
     # Scheduler
     tasks.append(asyncio.create_task(run_daily_reset(store, settings), name="scheduler"))
 
+    # Memory profiler (only if tracemalloc was started in cli())
+    import tracemalloc
+    if tracemalloc.is_tracing():
+        tasks.append(asyncio.create_task(_mem_profile_loop(), name="memprof"))
+        logger.info("Memory profiler enabled (logs every 5m)")
+
     exchange_map = {ex.name: ex for ex in exchanges}
 
     # News poller (delistings, new listings, dynamic subscribe/unsubscribe)
@@ -161,6 +195,12 @@ async def run(mode: str) -> None:
             ),
             name="news-poller",
         ))
+
+    # Signal evaluator (continuous event detection)
+    tasks.append(asyncio.create_task(
+        run_signal_evaluator(store, signal_history, dispatcher, settings),
+        name="signal-evaluator",
+    ))
 
     # API server
 
@@ -189,8 +229,10 @@ async def run(mode: str) -> None:
     # Graceful shutdown
     shutdown_event = asyncio.Event()
 
-    def _signal_handler():
-        logger.info("Shutdown signal received, saving snapshot...")
+    def _do_shutdown():
+        if shutdown_event.is_set():
+            return
+        logger.info("Shutting down, saving snapshot...")
         if recorder is not None:
             recorder.stop()
         store.snapshot_save(_SNAPSHOT_PATH)
@@ -200,12 +242,20 @@ async def run(mode: str) -> None:
         for t in tasks:
             t.cancel()
 
+    def _signal_handler():
+        _do_shutdown()
+
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except NotImplementedError:
             pass  # Windows
+
+    # When the TUI exits (user pressed q), shut down everything else
+    if mode in ("tui", "both"):
+        tui_task = next(t for t in tasks if t.get_name() == "tui")
+        tui_task.add_done_callback(lambda _: _do_shutdown())
 
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -239,7 +289,16 @@ def cli() -> None:
         default=None,
         help="Server URL for client mode (default: http://localhost:{api.port})",
     )
+    parser.add_argument(
+        "--mem-profile",
+        action="store_true",
+        help="Enable tracemalloc memory profiling (logs top allocators every 5 min)",
+    )
     args = parser.parse_args()
+
+    if args.mem_profile:
+        import tracemalloc
+        tracemalloc.start(10)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),

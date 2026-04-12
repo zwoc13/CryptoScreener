@@ -5,6 +5,7 @@ import logging
 from collections import deque
 from time import time
 
+from . import bias as bias_mod
 from .config import Settings
 from .models import (
     CandleBar,
@@ -254,6 +255,30 @@ class Engine:
     ) -> None:
         self._impulse_cooldown[key := f"{ticker.exchange}:{ticker.symbol}"] = now
         liq_buys, liq_sells = self._store.get_liq_rolling(ticker.exchange, ticker.symbol, 300)
+
+        # Pre-compute order-flow features for bias scoring
+        cvd_5m_val = round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 300), 2)
+        cvd_1h_val = round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 3600), 2)
+        cvd_4h_val = round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 14400), 2)
+        oi_1h = round(self._store.get_oi_change_pct(ticker.exchange, ticker.symbol, 3600), 2)
+        oi_4h = round(self._store.get_oi_change_pct(ticker.exchange, ticker.symbol, 14400), 2)
+        buy_5m = round(self._store.get_trade_imbalance(ticker.exchange, ticker.symbol, 300), 4)
+        buy_15m = round(self._store.get_trade_imbalance(ticker.exchange, ticker.symbol, 900), 4)
+        buy_persist = round(self._store.get_trade_imbalance_persistence(
+            ticker.exchange, ticker.symbol, 300,
+        ), 4)
+
+        # Compute directional bias
+        long_score, short_score, label = bias_mod.compute_bias(
+            direction=direction,
+            cvd_5m=cvd_5m_val, cvd_1h=cvd_1h_val, cvd_4h=cvd_4h_val,
+            oi_change_5m=ticker.oi_change_5m_pct, oi_change_1h=oi_1h,
+            buy_pct_5m=buy_5m, buy_persistence_5m=buy_persist,
+            funding_rate=ticker.funding_rate, natr=ticker.natr_5m_14,
+            change_pct=change_pct,
+            funding_interval_h=ticker.funding_interval_h,
+        )
+
         event = ImpulseEvent(
             exchange=ticker.exchange,
             symbol=ticker.symbol,
@@ -263,8 +288,8 @@ class Engine:
             natr_value=round(ticker.natr_5m_14, 4),
             price=new_price,
             volume_24h=ticker.volume_24h,
-            cvd_5m=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 300), 2),
-            cvd_1h=round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 3600), 2),
+            cvd_5m=cvd_5m_val,
+            cvd_1h=cvd_1h_val,
             cvd_daily=round(self._store.get_cvd_daily(ticker.exchange, ticker.symbol), 2),
             funding_rate=ticker.funding_rate,
             trend=ticker.trend,
@@ -278,11 +303,22 @@ class Engine:
             liq_buys_5m=round(liq_buys, 2),
             liq_sells_5m=round(liq_sells, 2),
             long_short_ratio=ticker.long_short_ratio,
+            # Directional bias layer
+            cvd_4h=cvd_4h_val,
+            oi_change_1h_pct=oi_1h,
+            oi_change_4h_pct=oi_4h,
+            buy_pct_5m=buy_5m,
+            buy_pct_15m=buy_15m,
+            buy_persistence_5m=buy_persist,
+            long_bias_score=long_score,
+            short_bias_score=short_score,
+            bias_label=label,
         )
         self._alert_queue.put_nowait(event)
         logger.info(
-            "Impulse: %s %s %s %.2f%% (NATR: %.4f)",
+            "Impulse: %s %s %s %.2f%% (NATR: %.4f) [%s L:%.0f S:%.0f]",
             ticker.exchange, ticker.symbol, direction, change_pct, ticker.natr_5m_14,
+            label, long_score, short_score,
         )
 
     def _check_impulse(

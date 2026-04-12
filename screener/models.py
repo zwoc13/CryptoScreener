@@ -22,7 +22,7 @@ def to_feed_id(symbol: str) -> str:
     return symbol
 
 
-@dataclass
+@dataclass(slots=True)
 class CandleBar:
     timestamp: float
     open: float
@@ -33,7 +33,7 @@ class CandleBar:
     confirmed: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class TickerState:
     exchange: str
     symbol: str
@@ -68,8 +68,13 @@ class TickerState:
     minute_low: float = float("inf")
     minute_start_ts: float = 0.0
 
+    # Display caches populated by the client-mode HTTP poller (see client.py).
+    # Server-side TUI uses its own cvd_cache dict and ignores these.
+    _cvd_5m: float = 0.0
+    _cvd_1h: float = 0.0
 
-@dataclass
+
+@dataclass(slots=True)
 class ImpulseEvent:
     exchange: str
     symbol: str
@@ -96,10 +101,20 @@ class ImpulseEvent:
     liq_buys_5m: float = 0.0  # USD vol of long liquidations in last 5m
     liq_sells_5m: float = 0.0  # USD vol of short liquidations in last 5m
     long_short_ratio: float = 0.0
+    # Directional bias layer (computed by screener.bias)
+    cvd_4h: float = 0.0
+    oi_change_1h_pct: float = 0.0
+    oi_change_4h_pct: float = 0.0
+    buy_pct_5m: float = 0.5
+    buy_pct_15m: float = 0.5
+    buy_persistence_5m: float = 0.0  # signed [-1, 1]
+    long_bias_score: float = 0.0     # [0, 100]
+    short_bias_score: float = 0.0    # [0, 100]
+    bias_label: str = "NEUTRAL"      # LONG | SHORT | CONFLICTED | AVOID | NEUTRAL
     timestamp: float = field(default_factory=time)
 
 
-@dataclass
+@dataclass(slots=True)
 class FundingAlert:
     exchange: str
     symbol: str
@@ -110,7 +125,7 @@ class FundingAlert:
 
 
 # Normalized messages from exchange adapters to engine
-@dataclass
+@dataclass(slots=True)
 class TickerMessage:
     exchange: str
     symbol: str
@@ -125,7 +140,7 @@ class TickerMessage:
     open_interest_value: float | None = None  # OI in USD
 
 
-@dataclass
+@dataclass(slots=True)
 class KlineMessage:
     exchange: str
     symbol: str
@@ -133,7 +148,7 @@ class KlineMessage:
     candle: CandleBar
 
 
-@dataclass
+@dataclass(slots=True)
 class TradeMessage:
     exchange: str
     symbol: str
@@ -143,7 +158,7 @@ class TradeMessage:
     timestamp: float
 
 
-@dataclass
+@dataclass(slots=True)
 class OpenInterestMessage:
     exchange: str
     symbol: str
@@ -152,7 +167,7 @@ class OpenInterestMessage:
     timestamp: float
 
 
-@dataclass
+@dataclass(slots=True)
 class LiquidationMessage:
     exchange: str
     symbol: str
@@ -162,7 +177,7 @@ class LiquidationMessage:
     timestamp: float
 
 
-@dataclass
+@dataclass(slots=True)
 class LongShortRatioMessage:
     exchange: str
     symbol: str
@@ -170,7 +185,7 @@ class LongShortRatioMessage:
     timestamp: float
 
 
-@dataclass
+@dataclass(slots=True)
 class LargeOrderEvent:
     exchange: str
     symbol: str
@@ -184,7 +199,7 @@ class LargeOrderEvent:
     timestamp: float = field(default_factory=time)
 
 
-@dataclass
+@dataclass(slots=True)
 class OrderEatenEvent:
     exchange: str
     symbol: str
@@ -198,7 +213,7 @@ class OrderEatenEvent:
     timestamp: float = field(default_factory=time)
 
 
-@dataclass
+@dataclass(slots=True)
 class NewsEvent:
     exchange: str
     news_type: str  # "delisting" | "new_listing"
@@ -209,6 +224,115 @@ class NewsEvent:
     symbols: list[str] = field(default_factory=list)  # affected symbols (raw)
     feed_ids: list[str] = field(default_factory=list)  # CCXT format
     timestamp: float = field(default_factory=time)
+
+
+@dataclass(slots=True)
+class BiasChangedEvent:
+    """Bias label changed between snapshots (exit signal)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"  # "up" | "down" | "neutral"
+    confidence: float = 0.0
+    prev_label: str = "NEUTRAL"
+    new_label: str = "NEUTRAL"
+    prev_long: float = 0.0
+    prev_short: float = 0.0
+    new_long: float = 0.0
+    new_short: float = 0.0
+
+
+@dataclass(slots=True)
+class CvdBurstEvent:
+    """Aggressive CVD burst relative to recent baseline (entry early-warning)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"  # "up" | "down" | "neutral"
+    confidence: float = 0.0
+    cvd_burst_1m: float = 0.0
+    cvd_baseline_5m: float = 0.0
+    burst_ratio: float = 0.0
+
+
+@dataclass(slots=True)
+class LiquidationCascadeEvent:
+    """Liquidation volume spike — forced flow (react differently than organic)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"
+    confidence: float = 0.0
+    liq_usd_1m: float = 0.0
+    liq_baseline_5m: float = 0.0
+    burst_ratio: float = 0.0
+    dominant_side: str = "-"  # "buy" | "sell" | "mixed"
+
+
+@dataclass(slots=True)
+class OiFlipEvent:
+    """OI change sign flipped and persisted (position-closing phase, exit signal)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"
+    confidence: float = 0.0
+    oi_change_prev: float = 0.0
+    oi_change_now: float = 0.0
+    persist_ticks: int = 0
+
+
+@dataclass(slots=True)
+class DivergenceEvent:
+    """Price made new high/low in window but CVD did not (exhaustion, fade signal)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"
+    confidence: float = 0.0
+    price_high: float = 0.0
+    price_low: float = 0.0
+    cvd_high: float = 0.0
+    cvd_low: float = 0.0
+
+
+@dataclass(slots=True)
+class VolumeSpikeEvent:
+    """5m volume > K × 24h baseline (attention signal, not directional)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"
+    confidence: float = 0.0
+    volume_5m: float = 0.0
+    volume_baseline: float = 0.0
+    spike_ratio: float = 0.0
+
+
+@dataclass(slots=True)
+class TrendChangedEvent:
+    """Trend string changed between snapshots (regime change, adjust risk)."""
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"
+    confidence: float = 0.0
+    prev_trend: str = "-"
+    new_trend: str = "-"
 
 
 # ── Compatibility aliases for types that botctl defined separately ──────────

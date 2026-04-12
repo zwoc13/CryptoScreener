@@ -118,7 +118,12 @@ def create_api(
                 while True:
                     event = await q.get()
                     # Determine event type name
-                    from .models import ImpulseEvent, FundingAlert, LargeOrderEvent, OrderEatenEvent, NewsEvent
+                    from .models import (
+                        BiasChangedEvent, CvdBurstEvent, DivergenceEvent,
+                        FundingAlert, ImpulseEvent, LargeOrderEvent,
+                        LiquidationCascadeEvent, NewsEvent, OiFlipEvent,
+                        OrderEatenEvent, TrendChangedEvent, VolumeSpikeEvent,
+                    )
                     if isinstance(event, ImpulseEvent):
                         etype = "impulse"
                     elif isinstance(event, FundingAlert):
@@ -129,6 +134,20 @@ def create_api(
                         etype = "order_eaten"
                     elif isinstance(event, NewsEvent):
                         etype = "news"
+                    elif isinstance(event, BiasChangedEvent):
+                        etype = "bias_changed"
+                    elif isinstance(event, CvdBurstEvent):
+                        etype = "cvd_burst"
+                    elif isinstance(event, LiquidationCascadeEvent):
+                        etype = "liq_cascade"
+                    elif isinstance(event, OiFlipEvent):
+                        etype = "oi_flip"
+                    elif isinstance(event, DivergenceEvent):
+                        etype = "divergence"
+                    elif isinstance(event, VolumeSpikeEvent):
+                        etype = "volume_spike"
+                    elif isinstance(event, TrendChangedEvent):
+                        etype = "trend_changed"
                     else:
                         etype = "unknown"
 

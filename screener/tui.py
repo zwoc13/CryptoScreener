@@ -13,7 +13,13 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from .alerts import AlertEvent
 from .config import Settings
-from .models import FundingAlert, ImpulseEvent, LargeOrderEvent, NewsEvent, OrderEatenEvent, TickerState
+from .models import (
+    BiasChangedEvent, CvdBurstEvent, DivergenceEvent,
+    FundingAlert, ImpulseEvent, LargeOrderEvent,
+    LiquidationCascadeEvent, NewsEvent, OiFlipEvent,
+    OrderEatenEvent, TickerState, TrendChangedEvent,
+    VolumeSpikeEvent,
+)
 from .store import Store
 
 # Column definitions: (label, sort_field)
@@ -21,17 +27,19 @@ from .store import Store
 COLUMNS: list[tuple[str, str]] = [
     ("Exchange", "exchange"),
     ("Ticker", "symbol"),
-    ("Trend", "trend"),
     ("Change %", "daily_change_pct"),
     ("CVD 5m", "_cvd_5m"),
     ("CVD 1h", "_cvd_1h"),
+    ("CVD 4h", "_cvd_4h"),
     ("CVD Day", "_cvd_daily"),
     ("Liq Net 5m", "_liq_net_5m"),
     ("NATR 5/14", "natr_5m_14"),
     ("OI Chg 5m", "oi_change_5m_pct"),
+    ("OI Chg 1h", "_oi_change_1h"),
     ("Fund %", "funding_rate"),
     ("Fund In", "next_funding_ts"),
     ("Buy% 1m", "_trade_imb_1m"),
+    ("Buy% 5m", "_trade_imb_5m"),
 ]
 
 
@@ -86,14 +94,25 @@ class AlertPanel(Static):
                 arrow = "[green]^[/green]" if event.direction == "up" else "[red]v[/red]"
                 color = "green" if event.direction == "up" else "red"
                 sign = "+" if event.direction == "up" else "-"
+                # Bias chip
+                _bias_styles = {
+                    "LONG": "[green][LONG][/green]",
+                    "SHORT": "[red][SHORT][/red]",
+                    "CONFLICTED": "[yellow][CONFL][/yellow]",
+                    "AVOID": "[dim][AVOID][/dim]",
+                    "NEUTRAL": "[dim][NEUT][/dim]",
+                }
+                bias_chip = _bias_styles.get(event.bias_label, "") + " "
                 lines.append(
                     f"[dim]{time_str}[/dim] {arrow} "
+                    f"{bias_chip}"
                     f"[bold]{event.symbol}[/bold] "
                     f"[{color}]{sign}{event.change_pct}%[/{color}] "
                     f"[dim]{event.exchange}[/dim]"
                 )
                 lines.append(
                     f"         NATR:{event.natr_value:.2f} "
+                    f"L:{event.long_bias_score:.0f} S:{event.short_bias_score:.0f} "
                     f"Vol:{_fmt_volume(event.volume_24h)}"
                 )
                 lines.append("")
@@ -115,6 +134,78 @@ class AlertPanel(Static):
                     f"[bold]{event.symbol}[/bold] "
                     f"${_fmt_volume(event.size_usd)} "
                     f"[dim]{status}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, BiasChangedEvent):
+                _bias_colors = {
+                    "LONG": "green", "SHORT": "red",
+                    "CONFLICTED": "yellow", "AVOID": "dim",
+                    "NEUTRAL": "dim",
+                }
+                color = _bias_colors.get(event.new_label, "white")
+                lines.append(
+                    f"[dim]{time_str}[/dim] [bold][BIAS] {event.prev_label}"
+                    f"→[/bold] [{color}]{event.new_label}[/{color}] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"L:{event.new_long:.0f} S:{event.new_short:.0f} "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, CvdBurstEvent):
+                arrow = "↑" if event.direction == "up" else "↓"
+                color = "green" if event.direction == "up" else "red"
+                lines.append(
+                    f"[dim]{time_str}[/dim] [{color}]F {arrow}[/color] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"CVD {event.burst_ratio:.1f}× baseline "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, LiquidationCascadeEvent):
+                color = "red"
+                lines.append(
+                    f"[dim]{time_str}[/dim] [{color}]F LIQ[/color] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"${_fmt_volume(event.liq_usd_1m)} "
+                    f"[{event.dominant_side} {event.burst_ratio:.1f}×] "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, VolumeSpikeEvent):
+                lines.append(
+                    f"[dim]{time_str}[/dim] [yellow]V VOL[/yellow] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"{event.spike_ratio:.1f}× baseline "
+                    f"vol:${_fmt_volume(event.volume_5m)} "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, DivergenceEvent):
+                color = "yellow"
+                lines.append(
+                    f"[dim]{time_str}[/dim] [{color}]D DIV[/color] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"conf:{event.confidence:.0f} "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, OiFlipEvent):
+                color = "green" if event.oi_change_now > 0 else "red"
+                lines.append(
+                    f"[dim]{time_str}[/dim] [{color}]B OI[/color] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"{event.oi_change_prev:+.1f}%→{event.oi_change_now:+.1f}% "
+                    f"[dim]{event.exchange}[/dim]"
+                )
+                lines.append("")
+            elif isinstance(event, TrendChangedEvent):
+                trends = {"UP": "green", "DOWN": "red", "RANGE": "yellow"}
+                color = trends.get(event.new_trend, "white")
+                lines.append(
+                    f"[dim]{time_str}[/dim] [{color}]T {event.prev_trend}"
+                    f"→{event.new_trend}[/color] "
+                    f"[bold]{event.symbol}[/bold] "
+                    f"[dim]{event.exchange}[/dim]"
                 )
                 lines.append("")
 
@@ -349,16 +440,14 @@ class ScreenerApp(App):
         ("t", "toggle_direction", "Asc/Desc"),
         ("e", "sort(0)", "sExchange"),
         ("n", "sort(1)", "sName"),
-        ("d", "sort(2)", "sTrend"),
-        ("c", "sort(3)", "sChange"),
-        ("v", "sort(4)", "sCVD5m"),
-        ("V", "sort(5)", "sCVD1h"),
-        ("1", "sort(6)", "sRng1m"),
-        ("5", "sort(7)", "sRng5m"),
+        ("c", "sort(2)", "sChange"),
+        ("v", "sort(3)", "sCVD5m"),
+        ("V", "sort(4)", "sCVD1h"),
+        ("l", "sort(7)", "sLiqNet"),
         ("a", "sort(8)", "sNATR"),
-        ("o", "sort(9)", "sVolume"),
-        ("f", "sort(10)", "sFund%"),
-        ("i", "sort(11)", "sFundIn"),
+        ("o", "sort(9)", "sOIChg5m"),
+        ("f", "sort(11)", "sFund%"),
+        ("i", "sort(12)", "sFundIn"),
         ("slash", "search", "/Search"),
     ]
 
@@ -454,18 +543,27 @@ class ScreenerApp(App):
             q = self._search_filter.upper()
             tickers = [t for t in tickers if q in t.symbol]
 
-        # Pre-compute CVD values for sorting and display
+        # Pre-compute cheap CVD values for all tickers (needed for sorting).
+        # Expensive columns (_cvd_4h, _oi_change_1h, _trade_imb_5m) are
+        # deferred to visible rows only — unless the user is sorting by one.
+        _EXPENSIVE = {"_cvd_4h", "_oi_change_1h", "_trade_imb_5m"}
+        need_expensive_all = field in _EXPENSIVE  # sorting by an expensive col
         cvd_cache: dict[str, dict[str, float]] = {}
         for t in tickers:
             k = f"{t.exchange}:{t.symbol}"
             liq_buy, liq_sell = self._store.get_liq_rolling(t.exchange, t.symbol, 300)
-            cvd_cache[k] = {
+            entry: dict[str, float] = {
                 "_cvd_5m": self._store.get_cvd_rolling(t.exchange, t.symbol, 300),
                 "_cvd_1h": self._store.get_cvd_rolling(t.exchange, t.symbol, 3600),
                 "_cvd_daily": self._store.get_cvd_daily(t.exchange, t.symbol),
                 "_liq_net_5m": liq_sell - liq_buy,
                 "_trade_imb_1m": self._store.get_trade_imbalance(t.exchange, t.symbol, 60),
             }
+            if need_expensive_all:
+                entry["_cvd_4h"] = self._store.get_cvd_rolling(t.exchange, t.symbol, 14400)
+                entry["_oi_change_1h"] = self._store.get_oi_change_pct(t.exchange, t.symbol, 3600)
+                entry["_trade_imb_5m"] = self._store.get_trade_imbalance(t.exchange, t.symbol, 300)
+            cvd_cache[k] = entry
 
         tickers.sort(
             key=lambda t: _sort_key(t, field, self._sort_desc, cvd_cache.get(f"{t.exchange}:{t.symbol}")),
@@ -480,21 +578,32 @@ class ScreenerApp(App):
                 break
             k = f"{t.exchange}:{t.symbol}"
             visible_keys.add(k)
-            cvd = cvd_cache.get(k, {"_cvd_5m": 0, "_cvd_1h": 0, "_cvd_daily": 0, "_liq_net_5m": 0, "_trade_imb_1m": 0.5})
+            cvd = cvd_cache.get(k, {
+                "_cvd_5m": 0, "_cvd_1h": 0, "_cvd_4h": 0, "_cvd_daily": 0,
+                "_liq_net_5m": 0, "_oi_change_1h": 0,
+                "_trade_imb_1m": 0.5, "_trade_imb_5m": 0.5,
+            })
+            # Compute expensive columns only for visible rows
+            if "_cvd_4h" not in cvd:
+                cvd["_cvd_4h"] = self._store.get_cvd_rolling(t.exchange, t.symbol, 14400)
+                cvd["_oi_change_1h"] = self._store.get_oi_change_pct(t.exchange, t.symbol, 3600)
+                cvd["_trade_imb_5m"] = self._store.get_trade_imbalance(t.exchange, t.symbol, 300)
             row_data = (
                 t.exchange.upper(),
                 _fmt_symbol(t.symbol, t.delist_ts, self._settings.filters.delist_filter_days),
-                _color_trend(t.trend),
                 _color_pct(t.daily_change_pct),
                 _color_cvd(cvd["_cvd_5m"]),
                 _color_cvd(cvd["_cvd_1h"]),
+                _color_cvd(cvd["_cvd_4h"]),
                 _color_cvd(cvd["_cvd_daily"]),
                 _color_cvd(cvd["_liq_net_5m"]),
                 f"{t.natr_5m_14:.1f}" if t.natr_5m_14 > 0 else "-",
                 _color_pct(t.oi_change_5m_pct),
+                _color_pct(cvd["_oi_change_1h"]),
                 _color_funding(t.funding_rate),
                 _fmt_funding_countdown(t.next_funding_ts),
                 _color_imbalance(cvd["_trade_imb_1m"]),
+                _color_imbalance(cvd["_trade_imb_5m"]),
             )
 
             if k in self._row_keys:
@@ -531,7 +640,7 @@ class ScreenerApp(App):
             f"  |  Alerts: {alert_count}"
             f"  |  Last update: {ago:.0f}s ago"
             f"{filter_info}"
-            f"  |  /=search  e n d c v V 1 5 a o f i  t=flip"
+            f"  |  /=search  e n c v V l a o f i  t=flip"
         )
 
     def _update_column_headers(self, table: DataTable) -> None:
