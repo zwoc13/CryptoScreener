@@ -2,20 +2,22 @@
 
 Periodically samples all tickers from the tiered store, computes bias, and
 appends a ``SignalSnapshot`` to ``SignalHistory``.  Then runs the detector
-chain and dispatches any events that fire.
+chain and dispatches any events that fires.  Also drives the FundingTracker
+for before/after analysis of extreme funding events.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from time import time
 
-from .alerts import AlertDispatcher
 from .signal_history import SignalHistory, SignalSnapshot
 from .store import Store
 from .detectors import DETECTORS
 from .config import Settings
+from .funding_tracker import FundingTracker, EXTREME_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ def _sample_signals(store: Store, ticker, now: float) -> SignalSnapshot:
     cvd_4h = store.get_cvd_rolling(ticker.exchange, ticker.symbol, 14400)
     oi_5m = ticker.oi_change_5m_pct
     oi_1h = store.get_oi_change_pct(ticker.exchange, ticker.symbol, 3600)
+    oi_4h = store.get_oi_change_pct(ticker.exchange, ticker.symbol, 14400)
+    oi_daily = store.get_oi_change_daily(ticker.exchange, ticker.symbol)
     buy_pct_5m = store.get_trade_imbalance(ticker.exchange, ticker.symbol, 300)
     buy_persist_5m = store.get_trade_imbalance_persistence(
         ticker.exchange, ticker.symbol, 300,
@@ -64,6 +68,8 @@ def _sample_signals(store: Store, ticker, now: float) -> SignalSnapshot:
         cvd_4h=round(cvd_4h, 2),
         oi_change_5m=round(oi_5m, 2),
         oi_change_1h=round(oi_1h, 2),
+        oi_change_4h=round(oi_4h, 2),
+        oi_change_daily=round(oi_daily, 2),
         buy_pct_5m=round(buy_pct_5m, 4),
         buy_persist_5m=round(buy_persist_5m, 4),
         long_bias=long_score,
@@ -81,7 +87,7 @@ def _sample_signals(store: Store, ticker, now: float) -> SignalSnapshot:
 async def run_signal_evaluator(
     store: Store,
     history: SignalHistory,
-    dispatcher: AlertDispatcher,
+    alert_queue: asyncio.Queue,
     settings: Settings,
 ) -> None:
     interval = getattr(settings, "signals", None)
@@ -92,6 +98,13 @@ async def run_signal_evaluator(
 
     logger.info("Signal evaluator started (interval=%.1fs)", interval)
     fired_counts: dict[str, int] = {}
+
+    # Initialize funding tracker
+    db_path = str(Path.home() / "work" / "tradesystem" / "screener" / "data" / "funding_events.db")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    funding_tracker = FundingTracker(db_path, store, history)
+    logger.info("Funding tracker initialized (db=%s, threshold=%.0f%%)",
+                db_path, EXTREME_THRESHOLD * 100)
 
     while True:
         try:
@@ -115,11 +128,15 @@ async def run_signal_evaluator(
                         if now - last_fired < 60:  # 1min per-ticker cooldown
                             continue
                         fired_counts[cooldown_key] = now
-                        await dispatcher.dispatch(event)
+                        await alert_queue.put(event)
                         logger.debug(
                             "Detector fired: %s %s %s",
                             etype, ticker.exchange, ticker.symbol,
                         )
+
+            # Check for extreme funding events (before/after tracking)
+            funding_tracker.check(now)
+
         except Exception:
             logger.exception("Signal evaluator error")
         await asyncio.sleep(interval)

@@ -155,7 +155,7 @@ class AlertPanel(Static):
                 arrow = "↑" if event.direction == "up" else "↓"
                 color = "green" if event.direction == "up" else "red"
                 lines.append(
-                    f"[dim]{time_str}[/dim] [{color}]F {arrow}[/color] "
+                    f"[dim]{time_str}[/dim] [{color}]F {arrow}[/{color}] "
                     f"[bold]{event.symbol}[/bold] "
                     f"CVD {event.burst_ratio:.1f}× baseline "
                     f"[dim]{event.exchange}[/dim]"
@@ -164,7 +164,7 @@ class AlertPanel(Static):
             elif isinstance(event, LiquidationCascadeEvent):
                 color = "red"
                 lines.append(
-                    f"[dim]{time_str}[/dim] [{color}]F LIQ[/color] "
+                    f"[dim]{time_str}[/dim] [{color}]F LIQ[/{color}] "
                     f"[bold]{event.symbol}[/bold] "
                     f"${_fmt_volume(event.liq_usd_1m)} "
                     f"[{event.dominant_side} {event.burst_ratio:.1f}×] "
@@ -183,7 +183,7 @@ class AlertPanel(Static):
             elif isinstance(event, DivergenceEvent):
                 color = "yellow"
                 lines.append(
-                    f"[dim]{time_str}[/dim] [{color}]D DIV[/color] "
+                    f"[dim]{time_str}[/dim] [{color}]D DIV[/{color}] "
                     f"[bold]{event.symbol}[/bold] "
                     f"conf:{event.confidence:.0f} "
                     f"[dim]{event.exchange}[/dim]"
@@ -192,7 +192,7 @@ class AlertPanel(Static):
             elif isinstance(event, OiFlipEvent):
                 color = "green" if event.oi_change_now > 0 else "red"
                 lines.append(
-                    f"[dim]{time_str}[/dim] [{color}]B OI[/color] "
+                    f"[dim]{time_str}[/dim] [{color}]B OI[/{color}] "
                     f"[bold]{event.symbol}[/bold] "
                     f"{event.oi_change_prev:+.1f}%→{event.oi_change_now:+.1f}% "
                     f"[dim]{event.exchange}[/dim]"
@@ -203,7 +203,7 @@ class AlertPanel(Static):
                 color = trends.get(event.new_trend, "white")
                 lines.append(
                     f"[dim]{time_str}[/dim] [{color}]T {event.prev_trend}"
-                    f"→{event.new_trend}[/color] "
+                    f"→{event.new_trend}[/{color}] "
                     f"[bold]{event.symbol}[/bold] "
                     f"[dim]{event.exchange}[/dim]"
                 )

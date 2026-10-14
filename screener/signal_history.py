@@ -33,6 +33,8 @@ class SignalSnapshot:
     liq_sell_5m: float
     natr: float
     trend: str
+    oi_change_4h: float = 0.0
+    oi_change_daily: float = 0.0
     range_1m: float = 0.0
     volume_5m: float = 0.0     # CVD volume magnitude for volume spike detection
 

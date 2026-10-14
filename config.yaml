@@ -60,6 +60,6 @@ orderbook:
   ws_connections: 10
 
 questdb:
-  enabled: false
-  host: "localhost"              # use "questdb" when running in Docker
+  enabled: true
+  host: "questdb"              # use "questdb" when running in Docker
   port: 9009

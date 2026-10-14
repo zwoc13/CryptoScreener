@@ -13,6 +13,9 @@ ENV PATH="/root/.local/bin:$PATH"
 COPY pyproject.toml .
 RUN uv sync --no-dev --no-install-project
 
+# Install questdb separately (it's not installed by uv sync due to --no-install-project)
+RUN pip install --no-cache-dir questdb>=2.0.0
+
 # Copy source
 COPY screener/ screener/
 COPY config.yaml .

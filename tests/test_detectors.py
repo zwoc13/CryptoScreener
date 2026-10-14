@@ -13,6 +13,7 @@ from screener.detectors import (
     detect_divergence,
     detect_volume_spike,
     detect_trend_change,
+    detect_pump_exhausted,
     K_CVD_BASELINE_SAMPLES,
     K_OI_FLIP_PERSIST,
     K_DIVERGENCE_WINDOW,
@@ -258,3 +259,354 @@ class TestTrendChange:
     def test_no_fire_with_insufficient_history(self):
         hist = deque([_make_snap(_now())])
         assert detect_trend_change(_make_ticker(), hist, _make_store_with_empty_cvd()) is None
+
+
+class TestPumpExhausted:
+    """Tests for the pump exhaustion detector."""
+
+    def _store_with_impulse(self, exchange: str, symbol: str, ts: float, direction: str) -> Store:
+        store = Store()
+        store.record_impulse(exchange, symbol, direction, ts)
+        return store
+
+    def test_no_fire_without_impulse(self):
+        """No impulse recorded → never fires."""
+        hist = deque()
+        now = _now()
+        for i in range(20):
+            hist.append(_make_snap(now - (20 - i) * 15, cvd_5m=5000.0, oi_change_5m=3.0))
+        store = Store()
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+    def test_no_fire_when_impulse_too_fresh(self):
+        """Impulse < 3 min ago → too fresh, don't fire."""
+        now = _now()
+        impulse_ts = now - 120  # 2 min ago
+        hist = deque()
+        # 10 snapshots × 15s = 150s from impulse → last snap age = 150s < 180s
+        # Also >= K_PUMP_MIN_SAMPLES (8) so we actually test the time gate
+        for i in range(10):
+            hist.append(_make_snap(impulse_ts + i * 15, cvd_5m=5000.0 - i * 200, oi_change_5m=3.0 - i * 0.2))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+    def test_no_fire_when_impulse_too_stale(self):
+        """Impulse > 4h ago → stale, don't fire."""
+        now = _now()
+        impulse_ts = now - 15000  # ~4.2h ago
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(now - (20 - i) * 15, cvd_5m=100.0, oi_change_5m=0.1))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+    def test_no_fire_when_cvd_rollback_insufficient(self):
+        """CVD hasn't rolled back enough → don't fire."""
+        now = _now()
+        impulse_ts = now - 600  # 10 min ago
+        hist = deque()
+        # CVD stays high (peak = 10000, current = 9000 → only 10% rollback)
+        for i in range(30):
+            hist.append(_make_snap(impulse_ts + i * 15, cvd_5m=10000.0, oi_change_5m=3.0))
+        hist.append(_make_snap(now, cvd_5m=9000.0, oi_change_5m=0.5))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+    def test_no_fire_when_oi_rollback_insufficient(self):
+        """OI hasn't rolled back enough → don't fire."""
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        # CVD rolled back 50% but OI only 5%
+        for i in range(30):
+            hist.append(_make_snap(impulse_ts + i * 15, cvd_5m=10000.0, oi_change_5m=3.0))
+        hist.append(_make_snap(now, cvd_5m=5000.0, oi_change_5m=2.85))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+    def test_fire_when_both_rollbacks_met(self):
+        """CVD rollback >= 20% AND OI rollback >= 10% → fires."""
+        now = _now()
+        impulse_ts = now - 600  # 10 min ago
+        hist = deque()
+        # Build pump window with high CVD and OI
+        for i in range(30):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=51000.0,
+                cvd_5m=10000.0,
+                oi_change_5m=5.0,
+                trend="UP",
+            ))
+        # Latest: CVD rolled back 40%, OI rolled back 60%
+        hist.append(_make_snap(now, price=50800.0, cvd_5m=6000.0, oi_change_5m=2.0, trend="RANGE"))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        ticker = _make_ticker(last_price=50800.0, trend="RANGE")
+        result = detect_pump_exhausted(ticker, hist, store)
+        assert result is not None
+        assert result.direction == "down"  # fade the up-pump
+        assert result.cvd_rollback_pct >= 20.0
+        assert result.oi_rollback_pct >= 10.0
+        assert result.impulse_direction == "up"
+        assert result.confidence > 30.0
+
+    def test_direction_fades_impulse(self):
+        """Up-pump → fade direction is 'down'. Down-pump → fade direction is 'up'."""
+        now = _now()
+        impulse_ts = now - 600
+
+        # Up-pump exhausted
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(impulse_ts + i * 15, price=51000.0, cvd_5m=8000.0, oi_change_5m=4.0))
+        hist.append(_make_snap(now, price=50500.0, cvd_5m=4000.0, oi_change_5m=1.0))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(), hist, store)
+        assert result is not None
+        assert result.direction == "down"
+
+        # Down-pump exhausted
+        hist2 = deque()
+        for i in range(20):
+            hist2.append(_make_snap(impulse_ts + i * 15, price=49000.0, cvd_5m=-8000.0, oi_change_5m=4.0))
+        hist2.append(_make_snap(now, price=49500.0, cvd_5m=-3000.0, oi_change_5m=1.0))
+        store2 = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "down")
+        result2 = detect_pump_exhausted(_make_ticker(), hist2, store2)
+        assert result2 is not None
+        assert result2.direction == "up"
+
+    def test_confidence_boost_on_price_rollback(self):
+        """Price pulled back 3%+ from peak → confidence boost."""
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(impulse_ts + i * 15, price=52000.0, cvd_5m=10000.0, oi_change_5m=5.0))
+        # Price pulled back 5%, CVD 40% rollback, OI 60% rollback
+        hist.append(_make_snap(now, price=49400.0, cvd_5m=6000.0, oi_change_5m=2.0))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(), hist, store)
+        assert result is not None
+        assert result.price_rollback_pct >= 3.0
+        assert result.confidence >= 70.0  # should get price boost
+
+    def test_confidence_boost_on_trend_shift(self):
+        """Trend shifted to RANGE or opposite → confidence boost."""
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(impulse_ts + i * 15, price=51000.0, cvd_5m=10000.0, oi_change_5m=5.0, trend="UP"))
+        # Trend shifted to RANGE, CVD and OI rolled back
+        hist.append(_make_snap(now, price=50900.0, cvd_5m=6000.0, oi_change_5m=2.0, trend="RANGE"))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(last_price=50900.0, trend="RANGE"), hist, store)
+        assert result is not None
+        assert result.trend_now == "RANGE"
+        assert result.confidence >= 70.0
+
+    def test_no_fire_with_insufficient_samples(self):
+        """Not enough snapshots in pump window → don't fire."""
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        # Only 3 snapshots in pump window (< K_PUMP_MIN_SAMPLES=8)
+        for i in range(3):
+            hist.append(_make_snap(impulse_ts + i * 15, cvd_5m=5000.0, oi_change_5m=3.0))
+        store = self._store_with_impulse("binance", "BTCUSDT", impulse_ts, "up")
+        assert detect_pump_exhausted(_make_ticker(), hist, store) is None
+
+
+class TestRaveScenarioDetector:
+    """RAVE-like scenarios at the detector level.
+
+    RAVE was a manipulated low-cap token where shorting the pump was
+    the wrong call — OI was rising (squeeze building), CVD was flat
+    (no real conviction), and the price kept pumping. These tests
+    verify the pump exhaustion detector does NOT fire during an
+    active squeeze.
+    """
+
+    def _store_with_impulse(self, exchange: str, symbol: str, ts: float, direction: str) -> Store:
+        store = Store()
+        store.record_impulse(exchange, symbol, direction, ts)
+        return store
+
+    def test_rave_squeeze_trap_oi_still_climbing(self):
+        """THE RAVE TRAP: CVD rolled back 30% but OI is STILL RISING.
+
+        This is the exact scenario that caused the liquidation.
+        CVD peaked at 5000, dropped to 3500 (30% rollback).
+        But OI went from 8% to 12% — squeeze is building, not dying.
+        Must NOT fire exhaustion.
+        """
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        # Pump phase: CVD building, OI climbing
+        for i in range(15):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=100.0 + i * 0.5,  # price still rising
+                cvd_5m=5000.0,
+                oi_change_5m=8.0 + i * 0.3,  # OI accelerating
+            ))
+        # Latest: CVD dropped but OI STILL climbing
+        hist.append(_make_snap(now, price=107.0, cvd_5m=3500.0, oi_change_5m=12.0))
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        ticker = _make_ticker(exchange="bybit", symbol="RAVEUSDT", last_price=107.0)
+        result = detect_pump_exhausted(ticker, hist, store)
+        assert result is None  # OI never rolled back — squeeze still active
+
+    def test_rave_oi_accelerating_through_pump(self):
+        """OI keeps accelerating (5% → 15% → 25%) throughout the pump.
+
+        Even though CVD may show some noise/rollback, OI is monotonically
+        increasing — new leveraged longs entering every minute. This is
+        a squeeze building, not exhaustion.
+        """
+        now = _now()
+        impulse_ts = now - 900  # 15 min ago
+        hist = deque()
+        for i in range(30):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=50.0 + i * 0.2,
+                cvd_5m=3000.0 + (i % 5) * 200,  # noisy CVD
+                oi_change_5m=5.0 + i * 0.6,  # OI: 5% → 23%
+            ))
+        hist.append(_make_snap(now, price=56.0, cvd_5m=2800.0, oi_change_5m=22.0))
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(exchange="bybit", symbol="RAVEUSDT"), hist, store)
+        assert result is None  # OI never rolled back
+
+    def test_rave_flat_cvd_tiny_peak(self):
+        """Low-cap token with tiny CVD peak (500 USD).
+
+        20% rollback of 500 = 100 USD. This is noise, not meaningful
+        exhaustion. But if OI also rolled back, the detector will fire.
+        This test documents the behavior — the detector fires because
+        both percentage gates are met, even though absolute values are tiny.
+        This is by design: percentage rollback is relative to the pump.
+        """
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=0.05,
+                cvd_5m=500.0,  # tiny absolute CVD
+                oi_change_5m=8.0,
+            ))
+        # Both rolled back
+        hist.append(_make_snap(now, price=0.048, cvd_5m=350.0, oi_change_5m=5.0))
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(exchange="bybit", symbol="RAVEUSDT"), hist, store)
+        # Fires because both percentage gates met — this is correct behavior
+        assert result is not None
+        assert result.cvd_rollback_pct >= 20.0
+        assert result.oi_rollback_pct >= 10.0
+
+    def test_rave_cvd_rollback_but_oi_squeeze_building(self):
+        """CVD dropped 40% but OI went from 5% to 15%.
+
+        Classic RAVE: the buying pressure (CVD) faded but leveraged
+        longs keep piling in (OI rising). This is a squeeze setup —
+        price will likely pump harder before it dies. Must NOT fire.
+        """
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        # Phase 1: CVD building
+        for i in range(10):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=200.0 + i,
+                cvd_5m=8000.0,
+                oi_change_5m=5.0,
+            ))
+        # Phase 2: CVD fading, OI accelerating (the RAVE pattern)
+        for i in range(10):
+            hist.append(_make_snap(
+                impulse_ts + (10 + i) * 15,
+                price=210.0 + i * 0.5,
+                cvd_5m=8000.0 - i * 400,  # 8000 → 4400
+                oi_change_5m=5.0 + i * 1.0,  # 5% → 15%
+            ))
+        hist.append(_make_snap(now, price=215.0, cvd_5m=4000.0, oi_change_5m=15.0))
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(exchange="bybit", symbol="RAVEUSDT"), hist, store)
+        assert result is None  # OI never rolled back — squeeze still building
+
+    def test_rave_full_squeeze_lifecycle_then_exhaustion(self):
+        """Full RAVE lifecycle: squeeze builds → peaks → finally exhausts.
+
+        Phase 1 (0-10min): OI rising 5%→20%, CVD building, price pumping
+        Phase 2 (10-15min): OI peaks at 20%, CVD starts fading
+        Phase 3 (15-20min): OI drops 20%→8%, CVD collapsed, price stalls
+        → Exhaustion fires ONLY in phase 3.
+        """
+        now = _now()
+        impulse_ts = now - 1200  # 20 min ago
+        hist = deque()
+
+        # Phase 1: squeeze building (0-10min, 40 snapshots)
+        for i in range(40):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=100.0 + i * 0.3,
+                cvd_5m=5000.0 + i * 100,
+                oi_change_5m=5.0 + i * 0.4,  # 5% → 21%
+                trend="UP",
+            ))
+
+        # Phase 2: OI plateau, CVD fading (10-15min, 20 snapshots)
+        for i in range(20):
+            hist.append(_make_snap(
+                impulse_ts + (40 + i) * 15,
+                price=112.0 - i * 0.1,
+                cvd_5m=9000.0 - i * 300,  # 9000 → 3000
+                oi_change_5m=21.0 - i * 0.2,  # 21% → 17%
+                trend="RANGE",
+            ))
+
+        # Phase 3: exhaustion — OI collapsed, CVD dead (latest snapshot)
+        hist.append(_make_snap(
+            now,
+            price=110.0,
+            cvd_5m=2000.0,  # 78% rollback from peak
+            oi_change_5m=8.0,  # 62% rollback from 21% peak
+            trend="RANGE",
+        ))
+
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(exchange="bybit", symbol="RAVEUSDT", last_price=110.0, trend="RANGE"), hist, store)
+        assert result is not None  # NOW it's safe — squeeze is over
+        assert result.direction == "down"
+        assert result.cvd_rollback_pct >= 70.0
+        assert result.oi_rollback_pct >= 50.0
+        assert result.confidence >= 80.0
+
+    def test_rave_price_pumping_but_cvd_diverging(self):
+        """Price makes new highs but CVD is declining — divergence.
+
+        Price went from 100 to 120 (+20%) but CVD peaked at 8000
+        and is now 3000. OI still rising though — the pump is driven
+        by leverage, not real buying. Classic RAVE trap.
+        Must NOT fire because OI hasn't rolled back.
+        """
+        now = _now()
+        impulse_ts = now - 600
+        hist = deque()
+        for i in range(20):
+            hist.append(_make_snap(
+                impulse_ts + i * 15,
+                price=100.0 + i,  # 100 → 120, new highs
+                cvd_5m=8000.0 - i * 250,  # 8000 → 3000, declining
+                oi_change_5m=3.0 + i * 0.5,  # 3% → 13%, rising
+            ))
+        hist.append(_make_snap(now, price=120.0, cvd_5m=3000.0, oi_change_5m=13.0))
+        store = self._store_with_impulse("bybit", "RAVEUSDT", impulse_ts, "up")
+        result = detect_pump_exhausted(_make_ticker(exchange="bybit", symbol="RAVEUSDT"), hist, store)
+        assert result is None  # OI still rising — not safe to short

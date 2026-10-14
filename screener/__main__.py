@@ -139,6 +139,7 @@ async def run(mode: str) -> None:
     # Signal history layer + evaluator (Phase C: continuous event generation)
     from .signal_history import SignalHistory
     from .evaluator import run_signal_evaluator
+    from .snapshot_writer import SnapshotWriter, AsyncSnapshotWriter
     signal_history = SignalHistory()
 
     ob_manager = None
@@ -198,9 +199,24 @@ async def run(mode: str) -> None:
 
     # Signal evaluator (continuous event detection)
     tasks.append(asyncio.create_task(
-        run_signal_evaluator(store, signal_history, dispatcher, settings),
+        run_signal_evaluator(store, signal_history, alert_queue, settings),
         name="signal-evaluator",
     ))
+
+    # Snapshot writer — flush signal history to QuestDB for ML pipeline
+    if settings.questdb.enabled:
+        writer = SnapshotWriter(settings.questdb, signal_history,
+                                flush_interval_s=settings.questdb.snapshot_flush_interval_s)
+        async_writer = AsyncSnapshotWriter(writer)
+        tasks.append(asyncio.create_task(
+            async_writer.start_flush_loop(store, settings.questdb.snapshot_flush_interval_s),
+            name="snapshot-writer",
+        ))
+        # Clean up on shutdown
+        def _close_writer():
+            async_writer.close()
+        import atexit
+        atexit.register(_close_writer)
 
     # API server
 
@@ -265,59 +281,203 @@ async def run(mode: str) -> None:
     logger.info("Screener stopped")
 
 
-def cli() -> None:
-    parser = argparse.ArgumentParser(description="Bybit Futures Screener")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="screener",
+        description="Bybit Futures Screener — real-time crypto screener daemon + TUI.",
+    )
+    # Global flags (work with or without the "run" subcommand for backward compat)
     parser.add_argument(
         "--mode",
         choices=["tui", "api", "both", "server", "client"],
-        default="both",
-        help="Run mode: both (default), server (headless daemon), client (TUI connects to server)",
+        default=None,
+        help="Run mode (default: both)",
     )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to config file",
-    )
+    parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level",
     )
-    parser.add_argument(
+    parser.add_argument("--server-url", default=None)
+    parser.add_argument("--mem-profile", action="store_true")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # ── run: Run the screener daemon ─────────────────────────────────────────
+    run_parser = sub.add_parser(
+        "run",
+        help="Run the screener (TUI + API in one process, same as bare screener)",
+    )
+    run_parser.add_argument(
+        "--mode",
+        choices=["tui", "api", "both", "server", "client"],
+        default="both",
+    )
+    run_parser.add_argument("--config", default="config.yaml")
+    run_parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+    run_parser.add_argument("--server-url", default=None)
+    run_parser.add_argument("--mem-profile", action="store_true")
+
+    # ── status: one-shot ticker dump ────────────────────────────────────────
+    status_parser = sub.add_parser(
+        "status",
+        help="One-shot ticker snapshot — connect to a running daemon via bash.",
+    )
+    status_parser.add_argument(
         "--server-url",
-        default=None,
-        help="Server URL for client mode (default: http://localhost:{api.port})",
+        default="http://localhost:8000",
+        help="Daemon URL (default: http://localhost:8000)",
     )
-    parser.add_argument(
-        "--mem-profile",
+    status_parser.add_argument(
+        "--sort",
+        "-s",
+        choices=["change", "symbol", "trend", "cvd5m", "cvd1h", "natr", "volume", "funding", "price", "oi"],
+        default="change",
+        help="Sort column (default: change)",
+    )
+    status_parser.add_argument("--exchange", "-e", default=None)
+    status_parser.add_argument("--min-change", "-m", type=float, default=None)
+    status_parser.add_argument(
+        "--limit", "-l", type=int, default=200,
+    )
+    status_parser.add_argument(
+        "--no-health",
         action="store_true",
-        help="Enable tracemalloc memory profiling (logs top allocators every 5 min)",
+        help="Skip health header",
     )
+
+    # ── watch: live terminal dashboard ─────────────────────────────────────
+    watch_parser = sub.add_parser(
+        "watch",
+        help="Live terminal dashboard — polls the daemon every N seconds.",
+    )
+    watch_parser.add_argument(
+        "--server-url",
+        default="http://localhost:8000",
+        help="Daemon URL (default: http://localhost:8000)",
+    )
+    watch_parser.add_argument(
+        "--sort",
+        "-s",
+        choices=["change", "symbol", "trend", "cvd5m", "cvd1h", "natr", "volume", "funding", "price", "oi"],
+        default="change",
+        help="Sort column (default: change)",
+    )
+    watch_parser.add_argument("--exchange", "-e", default=None)
+    watch_parser.add_argument("--min-change", "-m", type=float, default=None)
+    watch_parser.add_argument("--limit", "-l", type=int, default=500)
+    watch_parser.add_argument(
+        "--interval", "-i", type=float, default=3.0,
+        help="Refresh interval in seconds (default: 3.0)",
+    )
+    watch_parser.add_argument(
+        "--top", "-n", type=int, default=50,
+        help="Show only top N tickers (default: 50, 0 = all)",
+    )
+    watch_parser.add_argument(
+        "--filter", "-f", type=str, default="",
+        help="Filter tickers by symbol or exchange containing string (case-insensitive)",
+    )
+
+    return parser
+
+
+def cli() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
-    if args.mem_profile:
+    # Normalize: bare "screener" or "screener run" → daemon
+    # Default: run the daemon (either via "screener run" or bare "screener")
+    if args.command is None or args.command == "run":
+        # args.mode comes from the main parser (or the run subparser when
+        # "screener run --mode server" is used — argparse merges them so
+        # the subparser value overwrites the main one).
+        effective_mode = args.mode or "both"
+        effective_config = args.config
+        effective_log_level = args.log_level
+        effective_server_url = args.server_url
+        effective_mem_profile = args.mem_profile
+
+        _run_daemon(
+            mode=effective_mode,
+            config=effective_config,
+            log_level=effective_log_level,
+            server_url=effective_server_url,
+            mem_profile=effective_mem_profile,
+        )
+        return
+
+    # Bash-friendly commands: status / watch
+    if args.command == "status":
+        from .bash_client import run_status
+        asyncio.run(
+            run_status(
+                server_url=args.server_url,
+                sort_by=args.sort,
+                exchange=args.exchange,
+                min_change=args.min_change,
+                limit=args.limit,
+                show_health=not args.no_health,
+            )
+        )
+        return
+
+    if args.command == "watch":
+        from .bash_client import run_watch
+        try:
+            asyncio.run(
+                run_watch(
+                    server_url=args.server_url,
+                    sort_by=args.sort,
+                    exchange=args.exchange,
+                    min_change=args.min_change,
+                    limit=args.limit,
+                    interval=args.interval,
+                    top_n=args.top,
+                    filter_text=args.filter,
+                )
+            )
+        except KeyboardInterrupt:
+            pass
+        return
+
+
+def _run_daemon(
+    mode: str,
+    config: str,
+    log_level: str,
+    server_url: str | None,
+    mem_profile: bool,
+) -> None:
+    """Run the screener daemon (tui/api/both/server/client mode)."""
+    if mem_profile:
         import tracemalloc
         tracemalloc.start(10)
 
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
+        level=getattr(logging, log_level),
         format="%(asctime)s %(name)-12s %(levelname)-8s %(message)s",
         datefmt="%H:%M:%S",
     )
 
     # When TUI is active, redirect logs from stderr into the TUI log panel
-    if args.mode in ("tui", "both"):
+    if mode in ("tui", "both"):
         from .tui import install_tui_logging
         install_tui_logging()
 
-    if args.mode == "client":
+    settings = load_settings(config)
+
+    if mode == "client":
         from .client import run_client
-        settings = load_settings(args.config)
-        url = args.server_url or f"http://localhost:{settings.api.port}"
+        url = server_url or f"http://localhost:{settings.api.port}"
         asyncio.run(run_client(url, settings))
     else:
-        asyncio.run(run(args.mode))
+        asyncio.run(run(mode))
 
 
 if __name__ == "__main__":

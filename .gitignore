@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 snapshot.json
+
+# Editor/Agent files
+.claude

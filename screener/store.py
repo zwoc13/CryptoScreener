@@ -70,6 +70,8 @@ class Store:
         self._cvd_60s: dict[str, deque[CvdBucket]] = {}
         # CVD daily accumulator (reset at 2 AM)
         self._cvd_daily: dict[str, float] = {}
+        # OI value at daily reset (for computing OI % change from start of day)
+        self._oi_reset: dict[str, float] = {}
 
         # ── Three-tier pyramid for liquidations (same shape as CVD) ──
         self._liq_1s: dict[str, deque[LiqBucket]] = {}
@@ -82,6 +84,10 @@ class Store:
         self._oi_1s: dict[str, deque[OiPoint]] = {}
         self._oi_10s: dict[str, deque[OiPoint]] = {}
         self._oi_60s: dict[str, deque[OiPoint]] = {}
+
+        # ── Impulse timestamp tracking (for pump exhaustion detection) ──
+        # key -> (timestamp, direction) of the last fired impulse
+        self._last_impulse: dict[str, tuple[float, str]] = {}
 
     def get_or_create_ticker(self, exchange: str, symbol: str) -> TickerState:
         k = _key(exchange, symbol)
@@ -102,6 +108,7 @@ class Store:
         self._cvd_10s.pop(k, None)
         self._cvd_60s.pop(k, None)
         self._cvd_daily.pop(k, None)
+        self._oi_reset.pop(k, None)
         # Liq tiers
         self._liq_1s.pop(k, None)
         self._liq_10s.pop(k, None)
@@ -110,12 +117,22 @@ class Store:
         self._oi_1s.pop(k, None)
         self._oi_10s.pop(k, None)
         self._oi_60s.pop(k, None)
+        # Impulse tracking
+        self._last_impulse.pop(k, None)
         self._symbol_count = len(self._tickers)
 
     def get_all_sorted(self) -> list[TickerState]:
         tickers = list(self._tickers.values())
         tickers.sort(key=lambda t: abs(t.daily_change_pct), reverse=True)
         return tickers
+
+    def record_impulse(self, exchange: str, symbol: str, direction: str, ts: float) -> None:
+        """Record that an impulse just fired for this ticker."""
+        self._last_impulse[_key(exchange, symbol)] = (ts, direction)
+
+    def get_last_impulse(self, exchange: str, symbol: str) -> tuple[float, str] | None:
+        """Return (timestamp, direction) of the last impulse, or None."""
+        return self._last_impulse.get(_key(exchange, symbol))
 
     def touch(self) -> None:
         self._last_message_ts = time()
@@ -540,7 +557,21 @@ class Store:
             if ticker.last_price > 0:
                 ticker.reset_price = ticker.last_price
             ticker.daily_change_pct = 0.0
+            # Capture OI at reset so we can compute daily % change from start of day
+            if ticker.open_interest > 0:
+                self._oi_reset[_key(ticker.exchange, ticker.symbol)] = ticker.open_interest
         self._cvd_daily.clear()
+
+    def get_oi_change_daily(self, exchange: str, symbol: str) -> float:
+        """OI % change since the last daily reset (vs OI at 2 AM reset)."""
+        k = _key(exchange, symbol)
+        reset_oi = self._oi_reset.get(k, 0.0)
+        if reset_oi <= 0:
+            return 0.0
+        ticker = self._tickers.get(k)
+        if ticker is None or ticker.open_interest <= 0:
+            return 0.0
+        return (ticker.open_interest - reset_oi) / reset_oi * 100
 
     # -- Stats --
 

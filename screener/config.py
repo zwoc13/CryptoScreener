@@ -101,6 +101,8 @@ class QuestDBConfig(BaseModel):
     auto_flush_rows: int = 10_000
     auto_flush_interval_ms: int = 1_000
     ticker_throttle_ms: int = 1000  # min ms between ticker records per symbol
+    # Snapshot writer (ML pipeline data capture)
+    snapshot_flush_interval_s: int = 60  # how often to flush signal snapshots to QuestDB
 
 
 class Settings(BaseModel):

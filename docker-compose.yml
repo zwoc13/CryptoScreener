@@ -7,7 +7,7 @@ services:
       - "9000:9000"   # Web Console + REST API
       - "8812:8812"   # PostgreSQL wire protocol
     volumes:
-      - questdb-data:/var/lib/questdb
+      - /mnt/nvme0n1/questdb-data:/var/lib/questdb
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9000/status || exit 1"]
       interval: 5s
@@ -17,22 +17,29 @@ services:
 
   screener:
     container_name: screener
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - SCREENER_TELEGRAM_TOKEN=${SCREENER_TELEGRAM_TOKEN:-}
+      - QUESTDB_HOST=trading-questdb
       - QUESTDB_ENABLED=true
-      - QUESTDB_HOST=questdb
-    depends_on:
-      questdb:
-        condition: service_healthy
     restart: unless-stopped
-    stdin_open: true  # docker run -i
-    tty: true         # docker run -t
-    command: ["uv", "run", "python", "-m", "screener", "--mode", "both"]
+    command: ["uv", "run", "python", "-m", "screener", "--mode", "server"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks:
+      - screener_default
+      - trading-pipeline_trading-net
 
-volumes:
-  questdb-data:
+networks:
+  screener_default:
+  trading-pipeline_trading-net:
+    external: true

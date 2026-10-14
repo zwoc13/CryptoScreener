@@ -105,6 +105,7 @@ class ImpulseEvent:
     cvd_4h: float = 0.0
     oi_change_1h_pct: float = 0.0
     oi_change_4h_pct: float = 0.0
+    oi_change_daily_pct: float = 0.0
     buy_pct_5m: float = 0.5
     buy_pct_15m: float = 0.5
     buy_persistence_5m: float = 0.0  # signed [-1, 1]
@@ -335,8 +336,39 @@ class TrendChangedEvent:
     new_trend: str = "-"
 
 
+@dataclass(slots=True)
+class PumpExhaustedEvent:
+    """Pump momentum has rolled back from peak — safe to fade.
+
+    Fired when CVD, OI, or volume have retreated significantly from
+    their peaks during a recent impulse, indicating the buying/selling
+    frenzy that powered the pump is over.
+    """
+    exchange: str
+    symbol: str
+    feed_id: str
+    timestamp: float = field(default_factory=time)
+    correlation_id: str | None = None
+    direction: str = "neutral"  # "up" | "down" — original pump direction
+    confidence: float = 0.0
+    impulse_ts: float = 0.0        # when the original pump fired
+    impulse_direction: str = ""    # "up" | "down"
+    # Peak values observed during the pump window
+    cvd_peak: float = 0.0
+    oi_peak: float = 0.0
+    price_peak: float = 0.0
+    # Current rollback from peak (0.0 = at peak, 0.3 = 30% below peak)
+    cvd_rollback_pct: float = 0.0
+    oi_rollback_pct: float = 0.0
+    price_rollback_pct: float = 0.0
+    # Current raw values for downstream consumers
+    cvd_now: float = 0.0
+    oi_change_now: float = 0.0
+    trend_now: str = "-"
+
+
 # ── Compatibility aliases for types that botctl defined separately ──────────
 # These allow trading bots to keep using the old names.
 FundingEvent = FundingAlert
-ScreenerEvent = ImpulseEvent | FundingAlert | LargeOrderEvent | OrderEatenEvent | NewsEvent
+ScreenerEvent = ImpulseEvent | FundingAlert | LargeOrderEvent | OrderEatenEvent | NewsEvent | PumpExhaustedEvent
 TickerData = TickerState  # bots used TickerData; in unified app they get the full TickerState

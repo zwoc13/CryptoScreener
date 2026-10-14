@@ -22,6 +22,7 @@ from .models import (
     LiquidationCascadeEvent,
     OiFlipEvent,
     DivergenceEvent,
+    PumpExhaustedEvent,
     VolumeSpikeEvent,
     TrendChangedEvent,
 )
@@ -55,6 +56,26 @@ K_DIVERGENCE_MIN_NATR = 0.1
 
 # Volume spike: 5m volume vs. 24h/288 baseline (5m bucket of 24h)
 K_VOLUME_SPIKE_MULTIPLIER = 3.0
+
+# ── Pump exhaustion thresholds ─────────────────────────────────────────────
+# Minimum age of the pump before we consider exhaustion (seconds)
+# Too fresh = still in the heat of the move
+K_PUMP_MIN_AGE_S = 180  # 3 minutes
+
+# Maximum age — stale pumps don't matter
+K_PUMP_MAX_AGE_S = 14400  # 4 hours
+
+# CVD rollback from peak required (0.20 = 20% below peak)
+K_CVD_ROLLBACK_THRESHOLD = 0.20
+
+# OI rollback from peak required (0.10 = 10% below peak)
+K_OI_ROLLBACK_THRESHOLD = 0.10
+
+# Minimum snapshots needed in the pump window for reliable peak detection
+K_PUMP_MIN_SAMPLES = 8  # 8 × 15s = 2 min of data
+
+# Price rollback threshold (0.03 = 3% from peak) — bonus signal
+K_PRICE_ROLLBACK_THRESHOLD = 0.03
 
 
 def _key(ticker: TickerState) -> str:
@@ -388,6 +409,120 @@ def detect_trend_change(
     return None
 
 
+def detect_pump_exhausted(
+    ticker: TickerState,
+    history: deque[SignalSnapshot],
+    store: Store,
+) -> PumpExhaustedEvent | None:
+    """Pump momentum has rolled back from peak — safe to fade.
+
+    Scans signal history since the last impulse to find peak CVD, OI, and
+    price.  Fires when CVD and OI have both retreated significantly from
+    their peaks, indicating the buying/selling frenzy that powered the
+    pump is over.
+
+    Requires TWO confirmations to fire:
+      1. CVD rolled back >= 20% from its pump-window peak
+      2. OI rolled back >= 10% from its pump-window peak
+
+    Additional confidence boosters:
+      - Price pulled back >= 3% from peak
+      - Trend changed to RANGE or opposite direction
+    """
+    impulse_info = store.get_last_impulse(ticker.exchange, ticker.symbol)
+    if impulse_info is None:
+        return None
+
+    impulse_ts, impulse_direction = impulse_info
+    now = history[-1].timestamp if history else 0.0
+    age = now - impulse_ts
+
+    # Time gates: not too fresh (still in the move), not too stale
+    if age < K_PUMP_MIN_AGE_S or age > K_PUMP_MAX_AGE_S:
+        return None
+
+    # Collect snapshots in the pump window
+    pump_window = [s for s in history if s.timestamp >= impulse_ts]
+    if len(pump_window) < K_PUMP_MIN_SAMPLES:
+        return None
+
+    latest = pump_window[-1]
+
+    # ── Find peaks during the pump window ──────────────────────────────────
+    # CVD peak: max absolute CVD_5m seen during the pump
+    cvd_peak = max(abs(s.cvd_5m) for s in pump_window)
+    # OI peak: max absolute oi_change_5m seen during the pump
+    oi_peak = max(abs(s.oi_change_5m) for s in pump_window)
+    # Price peak: depends on impulse direction
+    if impulse_direction == "up":
+        price_peak = max(s.price for s in pump_window)
+    else:
+        price_peak = min(s.price for s in pump_window)
+
+    # ── Compute rollback from peak ─────────────────────────────────────────
+    cvd_now = abs(latest.cvd_5m)
+    oi_now = abs(latest.oi_change_5m)
+
+    cvd_rollback = (1.0 - cvd_now / cvd_peak) if cvd_peak > 0 else 0.0
+    oi_rollback = (1.0 - oi_now / oi_peak) if oi_peak > 0 else 0.0
+
+    # Price rollback
+    if impulse_direction == "up" and price_peak > 0:
+        price_rollback = (price_peak - latest.price) / price_peak
+    elif impulse_direction == "down" and price_peak > 0:
+        price_rollback = (latest.price - price_peak) / price_peak
+    else:
+        price_rollback = 0.0
+
+    # ── Gate: need both CVD AND OI rollback ────────────────────────────────
+    cvd_ok = cvd_rollback >= K_CVD_ROLLBACK_THRESHOLD
+    oi_ok = oi_rollback >= K_OI_ROLLBACK_THRESHOLD
+
+    if not (cvd_ok and oi_ok):
+        return None
+
+    # ── Confidence scoring ─────────────────────────────────────────────────
+    # Base: how deep the rollbacks are (deeper = more confident)
+    confidence = 30.0  # base for passing the two gates
+    confidence += min(30.0, cvd_rollback * 50)  # up to +30 at 60% rollback
+    confidence += min(20.0, oi_rollback * 50)   # up to +20 at 40% rollback
+
+    # Booster: price also pulled back
+    if price_rollback >= K_PRICE_ROLLBACK_THRESHOLD:
+        confidence += 10.0
+
+    # Booster: trend shifted to RANGE or opposite direction
+    if impulse_direction == "up" and latest.trend in ("RANGE", "DOWN"):
+        confidence += 10.0
+    elif impulse_direction == "down" and latest.trend in ("RANGE", "UP"):
+        confidence += 10.0
+
+    confidence = min(100.0, confidence)
+
+    # Direction for the fade: opposite of the original pump
+    fade_direction = "down" if impulse_direction == "up" else "up"
+
+    return PumpExhaustedEvent(
+        exchange=ticker.exchange,
+        symbol=ticker.symbol,
+        feed_id=ticker.feed_id,
+        timestamp=now,
+        direction=fade_direction,
+        confidence=round(confidence, 1),
+        impulse_ts=impulse_ts,
+        impulse_direction=impulse_direction,
+        cvd_peak=round(cvd_peak, 2),
+        oi_peak=round(oi_peak, 2),
+        price_peak=round(price_peak, 6),
+        cvd_rollback_pct=round(cvd_rollback * 100, 1),
+        oi_rollback_pct=round(oi_rollback * 100, 1),
+        price_rollback_pct=round(price_rollback * 100, 1),
+        cvd_now=round(cvd_now, 2),
+        oi_change_now=round(latest.oi_change_5m, 2),
+        trend_now=latest.trend,
+    )
+
+
 # Ordered list of detectors for the evaluator to run deterministically.
 DETECTORS = [
     detect_bias_changed,
@@ -397,4 +532,5 @@ DETECTORS = [
     detect_divergence,
     detect_volume_spike,
     detect_trend_change,
+    detect_pump_exhausted,
 ]

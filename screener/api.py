@@ -9,6 +9,7 @@ from time import time
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from starlette.responses import StreamingResponse
+from contextlib import asynccontextmanager
 
 from .alerts import AlertEvent
 from .bus import EventBus
@@ -24,6 +25,7 @@ def _ticker_dict(store: Store, t) -> dict:
         "daily_change_pct": round(t.daily_change_pct, 2),
         "cvd_5m": round(store.get_cvd_rolling(t.exchange, t.symbol, 300), 2),
         "cvd_1h": round(store.get_cvd_rolling(t.exchange, t.symbol, 3600), 2),
+        "cvd_4h": round(store.get_cvd_rolling(t.exchange, t.symbol, 14400), 2),
         "cvd_daily": round(store.get_cvd_daily(t.exchange, t.symbol), 2),
         "range_1m": t.range_1m,
         "range_5m": t.range_5m,
@@ -38,6 +40,8 @@ def _ticker_dict(store: Store, t) -> dict:
         "last_update_ts": t.last_update_ts,
         "open_interest": t.open_interest,
         "oi_change_5m_pct": round(t.oi_change_5m_pct, 2),
+        "oi_change_1h_pct": round(store.get_oi_change_pct(t.exchange, t.symbol, 3600), 2),
+        "buy_persistence_5m": round(store.get_trade_imbalance_persistence(t.exchange, t.symbol, 300), 4),
         "long_short_ratio": t.long_short_ratio,
         "delist_ts": t.delist_ts,
     }
@@ -50,8 +54,19 @@ def create_api(
     event_bus: EventBus | None = None,
     exchanges: dict | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Bybit Screener API", version="0.1.0")
     _exchanges = exchanges or {}
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            yield
+        except asyncio.CancelledError:
+            # Suppress CancelledError raised inside the server during shutdown.
+            # This prevents the traceback on Ctrl+C when uvicorn's lifespan
+            # receive() is cancelled before it can process the shutdown event.
+            pass
+
+    app = FastAPI(title="Bybit Screener API", version="0.1.0", lifespan=lifespan)
 
     @app.get("/tickers")
     def get_tickers(
@@ -122,7 +137,8 @@ def create_api(
                         BiasChangedEvent, CvdBurstEvent, DivergenceEvent,
                         FundingAlert, ImpulseEvent, LargeOrderEvent,
                         LiquidationCascadeEvent, NewsEvent, OiFlipEvent,
-                        OrderEatenEvent, TrendChangedEvent, VolumeSpikeEvent,
+                        OrderEatenEvent, PumpExhaustedEvent,
+                        TrendChangedEvent, VolumeSpikeEvent,
                     )
                     if isinstance(event, ImpulseEvent):
                         etype = "impulse"
@@ -148,6 +164,8 @@ def create_api(
                         etype = "volume_spike"
                     elif isinstance(event, TrendChangedEvent):
                         etype = "trend_changed"
+                    elif isinstance(event, PumpExhaustedEvent):
+                        etype = "pump_exhausted"
                     else:
                         etype = "unknown"
 

@@ -20,6 +20,7 @@ from .models import (
     NewsEvent,
     OiFlipEvent,
     OrderEatenEvent,
+    PumpExhaustedEvent,
     TrendChangedEvent,
     VolumeSpikeEvent,
 )
@@ -39,6 +40,7 @@ AlertEvent = (
     | DivergenceEvent
     | VolumeSpikeEvent
     | TrendChangedEvent
+    | PumpExhaustedEvent
 )
 
 
@@ -100,6 +102,8 @@ class AlertDispatcher:
             alert_type = "volume_spike"
         elif isinstance(event, TrendChangedEvent):
             alert_type = "trend_changed"
+        elif isinstance(event, PumpExhaustedEvent):
+            alert_type = "pump_exhausted"
         else:
             return None
 
@@ -125,6 +129,8 @@ class AlertDispatcher:
                 cooldown = 300  # flow events: longer cooldown
             elif isinstance(event, DivergenceEvent):
                 cooldown = 180  # moderate cooldown
+            elif isinstance(event, PumpExhaustedEvent):
+                cooldown = 180  # pump exhaustion: moderate cooldown
             else:
                 cooldown = self._settings.alerts.cooldown_seconds
         last = self._cooldowns.get(key, 0)
@@ -337,6 +343,20 @@ class AlertDispatcher:
             return (
                 f"*T Trend Change* `{event.exchange.upper()}`\n"
                 f"*{event.symbol}* `{event.prev_trend}` → `{event.new_trend}`"
+            )
+        elif isinstance(event, PumpExhaustedEvent):
+            arrow = "↓" if event.direction == "down" else "↑"
+            return (
+                f"*P Pump Exhausted {arrow}* `{event.exchange.upper()}`\n"
+                f"*{event.symbol}* fade `{event.impulse_direction}` "
+                f"conf:`{event.confidence:.0f}`\n"
+                f"CVD: `{event.cvd_now:.0f}` (peak `{event.cvd_peak:.0f}`, "
+                f"-`{event.cvd_rollback_pct:.0f}%`)\n"
+                f"OI chg: `{event.oi_change_now:+.2f}%` (peak `{event.oi_peak:+.2f}%`, "
+                f"-`{event.oi_rollback_pct:.0f}%`)\n"
+                f"Price: `{event.price_peak}` → now, "
+                f"-`{event.price_rollback_pct:.1f}%`\n"
+                f"Trend: `{event.trend_now}`"
             )
         return str(event)
 

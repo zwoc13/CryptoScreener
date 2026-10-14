@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn[standard]>=0.42.0",
     "websockets>=16.0",
     "questdb>=2.0.0",
+    "psycopg2-binary>=2.9.0",  # QuestDB psql wire protocol (microsecond timestamps)
 ]
 
 [project.scripts]

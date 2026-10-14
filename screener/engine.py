@@ -262,6 +262,7 @@ class Engine:
         cvd_4h_val = round(self._store.get_cvd_rolling(ticker.exchange, ticker.symbol, 14400), 2)
         oi_1h = round(self._store.get_oi_change_pct(ticker.exchange, ticker.symbol, 3600), 2)
         oi_4h = round(self._store.get_oi_change_pct(ticker.exchange, ticker.symbol, 14400), 2)
+        oi_daily = round(self._store.get_oi_change_daily(ticker.exchange, ticker.symbol), 2)
         buy_5m = round(self._store.get_trade_imbalance(ticker.exchange, ticker.symbol, 300), 4)
         buy_15m = round(self._store.get_trade_imbalance(ticker.exchange, ticker.symbol, 900), 4)
         buy_persist = round(self._store.get_trade_imbalance_persistence(
@@ -307,6 +308,7 @@ class Engine:
             cvd_4h=cvd_4h_val,
             oi_change_1h_pct=oi_1h,
             oi_change_4h_pct=oi_4h,
+            oi_change_daily_pct=oi_daily,
             buy_pct_5m=buy_5m,
             buy_pct_15m=buy_15m,
             buy_persistence_5m=buy_persist,
@@ -315,6 +317,7 @@ class Engine:
             bias_label=label,
         )
         self._alert_queue.put_nowait(event)
+        self._store.record_impulse(ticker.exchange, ticker.symbol, direction, now)
         logger.info(
             "Impulse: %s %s %s %.2f%% (NATR: %.4f) [%s L:%.0f S:%.0f]",
             ticker.exchange, ticker.symbol, direction, change_pct, ticker.natr_5m_14,
